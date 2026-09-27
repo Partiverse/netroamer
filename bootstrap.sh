@@ -17,157 +17,514 @@ for arg in "$@"; do
   esac
 done
 
-# ---------------------------------------------------------------
-# 诊断模式：只读检查，不做任何修改
-# ---------------------------------------------------------------
+# ============================================================
+# 交互式诊断模式（诊断段禁用 set -eu，避免 bash 3.2 误退出）
+# ============================================================
 if [ "$DIAGNOSE" = true ]; then
-  DIAG_FAIL=0
-  diag() { local ok=$1; local msg=$2; if [ "$ok" = 0 ]; then echo "  ✅ $msg"; else echo "  ❌ $msg"; DIAG_FAIL=1; fi; }
-  warn() { echo "  ⚠️  $1"; }
+  # bash 3.2: set -u 对未定义变量报 unbound variable；
+  # 大量 curl/nc 命令会返回非零，set -e 频繁触发退出。
+  # 在整个 DIAGNOSE 段统一禁用严格模式，结束后恢复。
+  set +eu
 
-  echo "=== netroamer 网络诊断 ==="
-  PORT="${PROXY_PORT:-7897}"
-
-  # 1. 端口连通性
-  echo "--- 1. 代理端口 (:$PORT) ---"
-  if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
-    exec 3>&- 3<&-
-    diag 0 "端口 $PORT 已开放"
-  elif nc -z -w 2 127.0.0.1 $PORT 2>/dev/null; then
-    diag 0 "端口 $PORT 已开放（nc 检测）"
-  else
-    diag 1 "端口 $PORT 未监听——Clash/mihomo 是否在运行？"
-  fi
-
-  # 2. Clash/mihomo 进程
-  echo "--- 2. 核心进程 ---"
-  CORE=$(pgrep -fl '(verge-mihomo|mihomo)' 2>/dev/null | grep -v pgrep | head -1)
-  if [ -n "$CORE" ]; then
-    diag 0 "核心进程运行中"
-    echo "    $(echo "$CORE" | cut -c1-80)"
-  else
-    diag 1 "未检测到 verge-mihomo/mihomo 进程"
-  fi
-
-  # 3. 系统代理状态
-  echo "--- 3. 系统代理（PAC）---"
-  if [ "$(uname)" = "Darwin" ]; then
-    PROXY_ENABLED=$(networksetup -getwebproxy Wi-Fi 2>/dev/null | awk '/^Enabled:/{print $2}')
-    PAC_ENABLED=$(networksetup -getproxybypassdomains "Wi-Fi" 2>/dev/null | head -1)
-    if [ "$PROXY_ENABLED" = "Yes" ]; then
-      diag 0 "Web/HTTPS 代理已开启"
-    else
-      warn "Web/HTTPS 代理未开启——浏览器流量可能直连"
-    fi
-  else
-    # Linux: 检查环境变量
-    if [ -n "$HTTP_PROXY" ] || [ -n "$http_proxy" ]; then
-      diag 0 "检测到代理环境变量 HTTP_PROXY=${HTTP_PROXY:-$http_proxy}"
-    else
-      warn "未检测到 HTTP_PROXY 环境变量（可能需要先 source rc 文件）"
-    fi
-  fi
-
-  # 4. TUN 模式（应关闭）
-  echo "--- 4. TUN 模式 ---"
+  # 显式定义诊断段依赖的变量（原写在脚本后部，bash 不报错但显式更安全）
+  OS="$(uname)"
+  PROXY_PORT="${PROXY_PORT:-7897}"
   CVR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
-  if [ -f "$CVR/verge.yaml" ]; then
-    if grep -E '^\s+enable_tun_mode:\s*true|^\s+enable:\s*true' "$CVR/verge.yaml" 2>/dev/null | grep -v 'false' | grep -q .; then
-      warn "检测到 TUN 已开启"
-      echo "    ⚠️  TUN 模式与 ZCode 直连冲突，建议关闭（verge.yaml: enable_tun_mode: false）"
-    else
-      diag 0 "TUN 模式未开启（正常）"
+  # set -u 时HOME/SHLVL/PROMPT_COMMAND 等内置变量始终存在，这里用 || true 双重保险
+  HOME="${HOME:-/Users/$(whoami)}"
+  SHELL="${SHELL:-/bin/zsh}"
+  # set -u 时数组索引展开不会触发报错，但变量展开会；
+  # 因此所有可能失败的 curl/nc 用 || true 垫底。
+  # ---- 彩色输出（TERM 不是 dumb 时才启用，避免 CI 日志乱码）----
+  if command -v tput >/dev/null 2>&1 && [ -n "${TERM:-}" ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${CI:-}" ]; then
+    R=$(tput setaf 1 2>/dev/null)   # 红色
+    G=$(tput setaf 2 2>/dev/null)   # 绿色
+    Y=$(tput setaf 3 2>/dev/null)   # 黄色
+    B=$(tput setaf 4 2>/dev/null)   # 蓝色
+    D=$(tput sgr0 2>/dev/null)      # 默认
+    BOLD=$(tput bold 2>/dev/null)
+  else
+    R="[ERR]"; G="[OK]"; Y="[WARN]"; B="[INFO]"; D=""; BOLD=""
+  fi
+  PASS=0; FAIL=0; WARN=0; FIX_COUNT=0
+
+  info()  { echo "  ${B}▶ $1${D}"; }
+  ok()    { echo "  ${G}✓ $1${D}"; ((PASS++)) || true; }
+  fail()  { echo "  ${R}✗ $1${D}"; ((FAIL++)) || true; }
+  warn()  { echo "  ${Y}⚠ $1${D}"; ((WARN++)) || true; }
+  rule()  { echo "${BOLD}=== $1 ===${D}"; }
+
+  # ---- 交互确认（CI 模式下自动跳过）----
+  ask_fix() {
+    # $1=检查名 $2=修复命令 $3=说明
+    echo ""
+    echo "  ${Y}发现问题：$1${D}"
+    [ -n "$3" ] && echo "  $3"
+    echo "  命令：${B}$2${D}"
+    if [ "${CI:-false}" = "true" ]; then
+      echo "  [CI 模式：自动跳过]"
+      return 1
     fi
+    echo -n "  是否自动修复？${BOLD}[Y/enter=修复 n=跳过]: ${D}"
+    local answer=""
+    read -r answer 2>/dev/null || true
+    case "$answer" in
+      n|n|N)  echo "  已跳过"; return 1 ;;
+      *)       echo "  执行修复..."; return 0 ;;
+    esac
+  }
+
+  # ---- 工具函数 ----
+  cmd_ok()  { "$@" >/dev/null 2>&1; return 0; }
+  cmd_out() { "$@" 2>/dev/null; }
+  port_open() {
+    (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+    nc -z -w 2 127.0.0.1 $1 2>/dev/null
+  }
+  http_code() {
+    local code
+    code=$(curl -s --noproxy '*' -o /dev/null -w "%{http_code}" --max-time "${2:-8}" "$1" 2>/dev/null) || true
+    echo "${code:-000}"
+  }
+  proxy_http_code() {
+    local code
+    code=$(curl -s -x "http://127.0.0.1:${PROXY_PORT:-7897}" -o /dev/null -w "%{http_code}" --max-time "${2:-10}" "$1" 2>/dev/null) || true
+    echo "${code:-000}"
+  }
+  resolve_time() {
+    local ms
+    ms=$(curl -s -o /dev/null -w "%{time_namelookup}" --max-time "${2:-5}" "$1" 2>/dev/null) || true
+    echo "${ms:-0}"
+  }
+
+  PROXY_PORT="${PROXY_PORT:-7897}"
+  CVR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+
+  echo ""
+  rule "netroamer 交互式网络诊断"
+  echo "  系统: $(uname)  |  Shell: ${SHELL##*/}  |  代理端口: $PROXY_PORT"
+  echo ""
+
+  # ============================================================
+  # 阶段一：核心进程与端口
+  # ============================================================
+  rule "阶段一：核心进程与端口"
+
+  info "检查代理端口 (:$PROXY_PORT)..."
+  if port_open "$PROXY_PORT"; then
+    ok "端口 $PROXY_PORT 已在监听"
+  else
+    fail "端口 $PROXY_PORT 未监听——Clash Verge / mihomo 是否在运行？"
+    echo "  建议：打开 Clash Verge，或在 Linux 上手动启动 mihomo"
+  fi
+
+  info "检查核心进程..."
+  CORE_PROC=$(pgrep -fl 'verge-mihomo|mihomo' 2>/dev/null | grep -v pgrep | head -1 || true)
+  if [ -n "$CORE_PROC" ]; then
+    ok "核心进程运行中"
+    echo "  PID: $(echo "$CORE_PROC" | awk '{print $1}')"
+  else
+    fail "未检测到 verge-mihomo / mihomo 进程"
+    if cmd_ok grep -q "Clash" /Applications 2>/dev/null; then
+      echo "  Clash Verge 已安装但未运行，尝试启动："
+      echo "    open -a 'Clash Verge'"
+    fi
+  fi
+
+  # ============================================================
+  # 阶段二：系统代理状态
+  # ============================================================
+  rule "阶段二：系统代理（PAC）"
+
+  if [ "$(uname)" = "Darwin" ]; then
+    info "检查 macOS 系统 Web/HTTPS 代理..."
+    WEB_PROXY=$(networksetup -getwebproxy "Wi-Fi" 2>/dev/null | awk '/^Enabled:/{print $2}')
+    HTTPS_PROXY=$(networksetup -getproxyhttps "Wi-Fi" 2>/dev/null | awk '/^Enabled:/{print $2}')
+    if [ "$WEB_PROXY" = "Yes" ] && [ "$HTTPS_PROXY" = "Yes" ]; then
+      ok "Web + HTTPS 系统代理已开启"
+    elif [ "$WEB_PROXY" = "Yes" ]; then
+      warn "仅 Web 代理开启，HTTPS 代理未开"
+      if ask_fix "HTTPS 代理未开启" \
+        "networksetup -setproxyhttps Wi-Fi 127.0.0.1 $PROXY_PORT" \
+        "HTTPS 代理未开，浏览器访问 HTTPS 站可能不走代理"; then
+        networksetup -setproxyhttps "Wi-Fi" "127.0.0.1" "$PROXY_PORT" \
+          && ok "HTTPS 代理已开启" || fail "HTTPS 代理开启失败"
+      fi
+    else
+      fail "系统代理未开启——浏览器流量直连，不受 Clash 规则保护"
+      echo "  后果：PAC 规则不生效，国内外流量全部直连"
+      if ask_fix "系统代理未开启" \
+        "networksetup -setwebproxy \"Wi-Fi\" 127.0.0.1 $PROXY_PORT && networksetup -setproxyhttps \"Wi-Fi\" 127.0.0.1 $PROXY_PORT" \
+        "开启系统代理使浏览器流量经 Clash 分流"; then
+        networksetup -setwebproxy "Wi-Fi" "127.0.0.1" "$PROXY_PORT" off \
+          && networksetup -setproxyhttps "Wi-Fi" "127.0.0.1" "$PROXY_PORT" off \
+          && ok "系统代理已开启" || fail "系统代理开启失败（权限？Clash 是否以 UI 模式运行？）"
+      fi
+    fi
+
+    info "检查 PAC bypass 绕过域名..."
+    BYPASS=$(networksetup -getproxybypassdomains "Wi-Fi" 2>/dev/null | tr '\n' ' ')
+    echo "  当前绕过: ${BYPASS:-（空）}"
+    # PAC bypass 和 NO_PROXY 是不同层级，两者都存在是正常的
+
+  else  # Linux
+    info "检查 shell 代理环境变量..."
+    if [ -n "$HTTP_PROXY" ] || [ -n "$http_proxy" ]; then
+      PROXY_CHAIN="${HTTP_PROXY:-$http_proxy}"
+      ok "HTTP_PROXY 已设置: $PROXY_CHAIN"
+      if [ -n "$NO_PROXY" ]; then
+        echo "  NO_PROXY 包含 ${#NO_PROXY} 个域名/网段"
+      fi
+    else
+      warn "当前 shell 未检测到 HTTP_PROXY（需先 source rc 文件后生效）"
+      echo "  如果是在新终端中运行，这是正常的——自动探测块在 rc 文件中"
+      echo "  诊断命令：bash netroamer/bootstrap.sh（会重新写入 rc 文件）"
+    fi
+  fi
+
+  # ============================================================
+  # 阶段三：TUN 模式深度检测
+  # ============================================================
+  rule "阶段三：TUN 模式"
+
+  info "检查 Clash Verge TUN 配置..."
+  if [ -f "$CVR/verge.yaml" ]; then
+    TUN_LINE=$(grep -n 'enable_tun_mode' "$CVR/verge.yaml" 2>/dev/null | grep -v '^#' | head -1 || true)
+    TUN_STACK=$(grep -n '^\s\+stack:' "$CVR/verge.yaml" 2>/dev/null | head -1 || true)
+    DNS_HIJACK=$(grep -n 'dns-hijack\|dns_hijack' "$CVR/verge.yaml" 2>/dev/null | grep -v '^#' | head -3 || true)
+
+    if echo "$TUN_LINE" | grep -q 'true'; then
+      fail "TUN 模式已开启！"
+      echo "  文件: $CVR/verge.yaml"
+      echo "  行: ${TUN_LINE}"
+      echo ""
+      echo "  ${R}这是 ZCode / AI 工具断网的根本原因！${D}"
+      echo "  TUN 劫持全系统路由 + fake-ip DNS，把本应直连的国内流量"
+      echo "  （bigmodel.cn / vectide.cn 等）全部送入代理隧道，"
+      echo "  导致 AI 开发工具连接超时。"
+      echo ""
+      if ask_fix "TUN 模式已开启" \
+        "sed -i '' 's/enable_tun_mode: true/enable_tun_mode: false/' $CVR/verge.yaml" \
+        "关闭 TUN 后需重启 Clash Verge 生效"; then
+        sed -i '' 's/enable_tun_mode: true/enable_tun_mode: false/' "$CVR/verge.yaml" 2>/dev/null \
+          && ok "已关闭 TUN（enable_tun_mode: false），请重启 Clash Verge" \
+          || fail "修改 verge.yaml 失败（权限？）"
+      fi
+    else
+      ok "TUN 模式未开启（正常）"
+      [ -n "$TUN_STACK" ] && echo "  当前 stack: $(echo "$TUN_STACK" | awk '{print $2}')"
+    fi
+
+    [ -n "$DNS_HIJACK" ] && echo "  DNS 劫持配置: $(echo "$DNS_HIJACK" | head -1 | cut -d: -f2- | tr -d ' ')"
   else
     warn "未找到 Clash Verge 配置文件（Clash Verge Rev 是否已安装？）"
   fi
 
-  # 5. DNS 配置
-  echo "--- 5. DNS ---"
+  # ============================================================
+  # 阶段四：DNS 解析链深度分析
+  # ============================================================
+  rule "阶段四：DNS 解析链"
+
   if [ "$(uname)" = "Darwin" ]; then
-    DNS_SERVERS=$(networksetup -getdnsservers "Wi-Fi" 2>/dev/null | grep -v "There aren't" | tr '\n' ' ')
-    if echo "$DNS_SERVERS" | grep -q "223.5.5.5\|119.29.29.29"; then
-      diag 0 "DNS 已国内化: $DNS_SERVERS"
-    elif [ -n "$DNS_SERVERS" ]; then
-      warn "DNS 未国内化，当前: $DNS_SERVERS"
-      echo "    运行: networksetup -setdnsservers Wi-Fi 223.5.5.5 119.29.29.29"
-    fi
-  elif [ "$(uname)" = "Linux" ]; then
-    if command -v resolvectl >/dev/null 2>&1; then
-      DNS=$(resolvectl status 2>/dev/null | awk '/DNS Servers:/{print $3; exit}')
-      if [ -n "$DNS" ]; then
-        if echo "$DNS" | grep -q "223.5.5.5\|119.29.29.29"; then
-          diag 0 "DNS 已国内化: $DNS"
-        else
-          warn "DNS 未国内化，当前: $DNS"
-        fi
+    DNS_SERVERS=$(networksetup -getdnsservers "Wi-Fi" 2>/dev/null | grep -v "There aren't" | grep -v "^$" | head -5)
+    info "当前 DNS 服务器:"
+    echo "$DNS_SERVERS" | while read -r dns; do
+      [ -n "$dns" ] && echo "    $dns"
+    done
+
+    DOMESTIC_DNS=false
+    if echo "$DNS_SERVERS" | grep -q "223.5.5.5\|119.29.29.29\|100.100.100.100"; then
+      ok "DNS 已国内化，解析速度快且不被污染"
+      DOMESTIC_DNS=true
+    else
+      fail "DNS 未国内化！"
+      echo "  当前 DNS: $DNS_SERVERS"
+      echo "  后果：国内域名解析慢或被污染，ZCode 等工具可能解析失败"
+      if ask_fix "DNS 未国内化" \
+        "networksetup -setdnsservers Wi-Fi 223.5.5.5 119.29.29.29" \
+        "改为阿里 223.5.5.5 + DNSPod 119.29.29.29，解析快且不污染"; then
+        networksetup -setdnsservers "Wi-Fi" 223.5.5.5 119.29.29.29 \
+          && ok "DNS 已改为 223.5.5.5 / 119.29.29.29" \
+          || fail "DNS 修改失败（检查网络接口名是否正确）"
       fi
     fi
   fi
 
-  # 6. 国内直连
-  echo "--- 6. 国内直连测试 ---"
-  DOMESTIC=$(curl -s --noproxy '*' -o /dev/null -w "%{http_code}" --max-time 8 "https://open.bigmodel.cn" 2>/dev/null)
-  if [[ "$DOMESTIC" == 2* || "$DOMESTIC" == 3* ]]; then
-    diag 0 "open.bigmodel.cn 直连正常 (HTTP $DOMESTIC)"
-  else
-    diag 1 "open.bigmodel.cn 直连异常 (HTTP $DOMESTIC)——检查网络/DNS"
-  fi
-
-  # 7. 代理出口
-  echo "--- 7. 代理出口测试 ---"
-  FOREIGN=""
-  if nc -z -w 1 127.0.0.1 $PORT 2>/dev/null; then
-    FOREIGN=$(curl -s -x "http://127.0.0.1:$PORT" -o /dev/null -w "%{http_code}" --max-time 10 \
-      "https://www.apple.com/library/test/success.html" 2>/dev/null) || true
-    if [ "${FOREIGN:-}" = "200" ]; then
-      diag 0 "代理出口正常（apple.com HTTP ${FOREIGN}）"
+  info "DNS 解析时间测试（国内域名，不走代理）..."
+  DOMAIN_TEST="open.bigmodel.cn"
+  RESOLVE_MS=$(resolve_time "https://$DOMAIN_TEST" 5)
+  if [ -n "$RESOLVE_MS" ]; then
+    MS_INT=$(printf "%.0f" "$RESOLVE_MS" 2>/dev/null || echo "0")
+    if [ "$MS_INT" -lt 50 ]; then
+      ok "DNS 解析时间 ${RESOLVE_MS}s（优秀）"
+    elif [ "$MS_INT" -lt 200 ]; then
+      warn "DNS 解析时间 ${RESOLVE_MS}s（一般，建议检查 DNS 配置）"
     else
-      warn "代理出口异常（apple.com HTTP ${FOREIGN:-未响应}）——代理节点可能故障"
+      fail "DNS 解析时间 ${RESOLVE_MS}s（过慢，可能 DNS 污染或服务器慢）"
     fi
   else
-    warn "跳过代理测试：端口 $PORT 未监听"
+    warn "DNS 解析测试超时（网络可能已断开）"
   fi
 
-  # 8. ZCode 关键域名 NO_PROXY 覆盖
-  echo "--- 8. NO_PROXY 关键域名 ---"
+  # ============================================================
+  # 阶段五：三层直连实际连通性验证
+  # ============================================================
+  rule "阶段五：三层直连保护——实际连通性验证"
+
+  info "第1层：PAC 直连——curl 直连测试（不走代理）"
+  ZCODE_DOMAINS=(
+    "open.bigmodel.cn"
+    "bigmodel.cn"
+    "vectide.cn"
+    "www.zhipuai.cn"
+    "hf-mirror.com"
+  )
+  LAYER1_FAIL=0
+  for dom in "${ZCODE_DOMAINS[@]}"; do
+    CODE=$(http_code "https://$dom" 8)
+    if [[ "$CODE" == 2* ]] || [[ "$CODE" == 3* ]]; then
+      ok "$dom → HTTP $CODE（直连正常）"
+    else
+      fail "$dom → HTTP ${CODE:-超时}（直连失败！）"
+      ((LAYER1_FAIL++))
+    fi
+  done
+  if [ $LAYER1_FAIL -gt 0 ]; then
+    echo ""
+    warn "第1层（PAC 直连）有 $LAYER1_FAIL 个域名直连失败"
+    echo "  排查步骤："
+    echo "    1. 检查 DNS 是否被污染：bash bootstrap.sh --diagnose（阶段四）"
+    echo "    2. 检查 TUN 是否开启（阶段三）"
+    echo "    3. 检查路由器/网关是否正常"
+  else
+    ok "第1层：全部 ZCode 域名直连正常"
+  fi
+
+  info "第2层：Clash 规则——通过代理访问 ZCode（验证代理链完整）"
+  LAYER2_FAIL=0
+  for dom in "${ZCODE_DOMAINS[@]}"; do
+    CODE=$(proxy_http_code "https://$dom" 10)
+    if [[ "$CODE" == 2* ]] || [[ "$CODE" == 3* ]]; then
+      ok "$dom → HTTP $CODE（经代理可达）"
+    else
+      warn "$dom → HTTP ${CODE:-超时}（代理链失败，但不影响直连）"
+      ((LAYER2_FAIL++))
+    fi
+  done
+  [ $LAYER2_FAIL -eq 0 ] && ok "第2层：所有域名经代理也可达"
+
+  info "第3层：NO_PROXY 环境变量"
   NO_PROXY_VAL=""
   if [ -n "${NO_PROXY:-}" ]; then
     NO_PROXY_VAL="$NO_PROXY"
   elif [ -f ~/.zshrc ]; then
-    NO_PROXY_VAL=$(grep -m1 'NO_PROXY=' ~/.zshrc 2>/dev/null | sed 's/.*NO_PROXY=//; s/"//g; s/'\''//g' | awk '{print $1}')
+    NO_PROXY_VAL=$(grep -m1 'NO_PROXY=' ~/.zshrc 2>/dev/null \
+      | sed 's/.*NO_PROXY=//; s/"//g' | awk '{print $1}')
   fi
-  ZCODE_DOMAINS="bigmodel.cn vectide.cn zhipuai.cn z.ai hf-mirror.com"
   ZCODE_MISSING=""
-  for dom in $ZCODE_DOMAINS; do
+  for dom in bigmodel.cn vectide.cn zhipuai.cn "z.ai" hf-mirror.com; do
     if [ -n "$NO_PROXY_VAL" ] && echo "$NO_PROXY_VAL" | grep -q "$dom"; then
-      :
+      ok "NO_PROXY 包含 $dom"
     else
       ZCODE_MISSING="$ZCODE_MISSING $dom"
     fi
   done
   if [ -n "$ZCODE_MISSING" ]; then
-    warn "NO_PROXY 缺少:${ZCODE_MISSING}"
+    warn "NO_PROXY 缺少以下域名：$ZCODE_MISSING"
+    echo "  这些域名可能经代理绕行（不影响直连，但不如直连快）"
+    if ask_fix "NO_PROXY 域名缺失" \
+      "重新运行 bash bootstrap.sh（会重建带完整域名的 rc 文件）" \
+      "bootstrap.sh 会写入包含全部 ZCode 域名的 NO_PROXY"; then
+      bash "$0" --no-dns --no-watchdog >/dev/null 2>&1 \
+        && ok "rc 文件已更新（需新终端生效）" \
+        || fail "bootstrap.sh 执行失败"
+    fi
   else
-    diag 0 "ZCode 关键域名均已纳入 NO_PROXY"
+    ok "第3层：NO_PROXY 包含全部关键域名"
   fi
 
-  # 9. 镜像配置
-  echo "--- 9. 包管理器镜像 ---"
-  PIP_OK=$(grep -q "pypi.tuna.tsinghua.edu.cn" "$HOME/.config/pip/pip.conf" 2>/dev/null && echo "1" || echo "0")
-  [ "$PIP_OK" = "1" ] && diag 0 "pip → 清华 TUNA" || warn "pip 未配置镜像（可能走代理）"
-  CARGO_OK=$(grep -q "rsproxy" "$HOME/.cargo/config.toml" 2>/dev/null && echo "1" || echo "0")
-  [ "$CARGO_OK" = "1" ] && diag 0 "cargo → 字节 rsproxy" || warn "cargo 未配置镜像"
-  NPM_OK=$(npm config get registry 2>/dev/null | grep -q "npmmirror" && echo "1" || echo "0")
-  [ "$NPM_OK" = "1" ] && diag 0 "npm → npmmirror" || warn "npm 未配置镜像"
+  # ============================================================
+  # 阶段六：代理出口与国际连通性
+  # ============================================================
+  rule "阶段六：代理出口与国际连通性"
 
+  info "测试代理出口（Apple 测试页）..."
+  FOREIGN_CODE=$(proxy_http_code "https://www.apple.com/library/test/success.html" 10)
+  if [ "${FOREIGN_CODE:-000}" = "200" ]; then
+    ok "代理出口正常（apple.com HTTP $FOREIGN_CODE）"
+  else
+    warn "代理出口异常（apple.com HTTP ${FOREIGN_CODE:-未响应}）"
+    echo "  可能原因：代理节点故障 / 订阅过期 / 节点被墙"
+    echo "  建议：到 Clash Verge 手动切换节点"
+  fi
+
+  info "测速基准（延迟）"
+  SPEEDS=(
+    "国内:https://open.bigmodel.cn"
+    "AI服务:https://api.zhipuai.cn"
+    "国际:https://www.google.com"
+  )
+  for entry in "${SPEEDS[@]}"; do
+    IFS=':' read -r label url <<< "$entry"
+    LATENCY=$(curl -s -o /dev/null -w "%{time_total}" --max-time 10 "$url" 2>/dev/null || echo "超时")
+    echo "    $label: ${LATENCY}s"
+  done
+
+  # ============================================================
+  # 阶段七：路由表与接口分析
+  # ============================================================
+  rule "阶段七：路由表与网络接口"
+
+  info "默认路由"
+  if [ "$(uname)" = "Darwin" ]; then
+    GATEWAY=$(netstat -nr 2>/dev/null | awk '/^default/ {print $2}' | head -1)
+    echo "    网关: ${GATEWAY:-未知}"
+    GATEWAY_LATENCY=$(nc -z -w 2 "$GATEWAY" 443 2>/dev/null && echo "可达" || echo "不可达")
+    echo "    网关连通: $GATEWAY_LATENCY"
+  else
+    ip route 2>/dev/null | awk '/^default/{print "    "$0}' || true
+  fi
+
+  info "虚拟网卡（TUN/TAP/utun）"
+  if [ "$(uname)" = "Darwin" ]; then
+    IFACES=$(ifconfig 2>/dev/null | awk '/^utun[0-9]/ {print $1}' | tr '\n' ' ')
+    if [ -n "$IFACES" ]; then
+      echo "    发现 utun 设备: $IFACES"
+      echo "    （可能为 Tailscale 或其他 VPN 软件）"
+    else
+      echo "    未发现 utun 设备（TUN 模式未激活，正常）"
+    fi
+  else
+    ip link 2>/dev/null | awk '/^[0-9]+: (tun|tap)/ {print "    "$2}' | sed 's/:$//' || true
+  fi
+
+  # ============================================================
+  # 阶段八：包管理器镜像
+  # ============================================================
+  rule "阶段八：包管理器镜像"
+
+  check_mirror() {
+    # $1=工具名 $2=检测命令 $3=期望值 $4=正确时的说明
+    local val; val=$($2 2>/dev/null)
+    if echo "$val" | grep -q "$3"; then
+      ok "$1 → $val（$4）"
+    else
+      warn "$1 → $val（不是最优，当前速度可能很慢）"
+      echo "    期望包含: $3"
+    fi
+  }
+
+  if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
+    PIP_REG=$(pip config get global.index-url 2>/dev/null || pip3 config get global.index-url 2>/dev/null || true)
+    PIP_REG=${PIP_REG:-$(grep -m1 'index-url' "$HOME/.config/pip/pip.conf" 2>/dev/null | sed 's/.*=//' | tr -d ' ' || true)}
+    if echo "$PIP_REG" | grep -q "tuna\|tsinghua\|npmmirror\|aliyun"; then
+      ok "pip → $PIP_REG"
+    else
+      fail "pip → ${PIP_REG:-（未配置）}"
+      if ask_fix "pip 未配置国内镜像" \
+        "pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple" \
+        "当前源在国外，pip install 可能极慢（10-20 KB/s）"; then
+        pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null \
+          && ok "pip → 清华 TUNA" \
+          || fail "pip 镜像配置失败"
+      fi
+    fi
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    NPM_REG=$(npm config get registry 2>/dev/null)
+    if echo "$NPM_REG" | grep -q "npmmirror\|cnpm\|taobao"; then
+      ok "npm → $NPM_REG"
+    else
+      fail "npm → ${NPM_REG:-（未配置）}"
+      if ask_fix "npm 未配置国内镜像" \
+        "npm config set registry https://registry.npmmirror.com" \
+        "当前源在国外，npm install 可能极慢"; then
+        npm config set registry https://registry.npmmirror.com \
+          && ok "npm → npmmirror" || fail "npm 镜像配置失败"
+      fi
+    fi
+  fi
+
+  if command -v cargo >/dev/null 2>&1 || [ -d "$HOME/.cargo" ]; then
+    if [ -f "$HOME/.cargo/config.toml" ] && grep -q "rsproxy\|ustc\|tuna" "$HOME/.cargo/config.toml" 2>/dev/null; then
+      ok "cargo → $(grep 'registry' "$HOME/.cargo/config.toml" 2>/dev/null | head -1 | sed 's/.*=//;s/ //g')"
+    else
+      fail "cargo → $(grep 'registry' "$HOME/.cargo/config.toml" 2>/dev/null | head -1 | sed 's/.*=//' || echo '（未配置）')"
+      if ask_fix "cargo 未配置国内镜像" \
+        "mkdir -p \$HOME/.cargo && cat > \$HOME/.cargo/config.toml <<'TOML'
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+[source.rsproxy-sparse]
+registry = 'sparse+https://rsproxy.cn/index/'
+[net]
+git-fetch-with-cli = true
+TOML" \
+        "当前源在国外，cargo build 可能极慢"; then
+        mkdir -p "$HOME/.cargo"
+        cat > "$HOME/.cargo/config.toml" <<'TOML'
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[net]
+git-fetch-with-cli = true
+TOML
+        ok "cargo → rsproxy-sparse" || fail "cargo 镜像配置失败"
+      fi
+    fi
+  fi
+
+  # ============================================================
+  # 阶段九：DNS 泄露测试
+  # ============================================================
+  rule "阶段九：DNS 泄露检测"
+
+  info "检测 DNS 泄露（查询 icanhazip.com 的实际出口 IP）..."
+  # 这个测试原理：在代理环境下查询 IP，Clash DNS 泄露会显示本机真实 IP 而非代理出口 IP
+  PROXY_IP=$(curl -s -x "http://127.0.0.1:$PROXY_PORT" --max-time 10 \
+    "https://api.ipify.org?format=text" 2>/dev/null || true)
+  DIRECT_IP=$(curl -s --noproxy '*' --max-time 10 \
+    "https://api.ipify.org?format=text" 2>/dev/null || true)
+  if [ -n "$PROXY_IP" ]; then
+    ok "代理出口 IP: $PROXY_IP"
+    [ -n "$DIRECT_IP" ] && echo "    直连 IP: $DIRECT_IP"
+    if [ "$PROXY_IP" = "$DIRECT_IP" ]; then
+      warn "代理 IP 与直连 IP 相同——代理可能未生效，或出口节点与本机同 IP 段"
+    fi
+  else
+    warn "无法获取代理出口 IP（节点可能故障）"
+  fi
+
+  # ============================================================
+  # 汇总报告
+  # ============================================================
+  rule "诊断汇总"
   echo ""
-  if [ "$DIAG_FAIL" = 0 ]; then
-    echo "✅ 所有检查通过，网络状态正常。"
+  echo "  ${G}✓ 通过: $PASS${D}"
+  [ "$WARN" -gt 0 ] && echo "  ${Y}⚠ 警告: $WARN${D}"
+  [ "$FAIL" -gt 0 ] && echo "  ${R}✗ 失败: $FAIL${D}"
+  echo ""
+
+  if [ "$FAIL" -gt 0 ]; then
+    echo "${R}${BOLD}有 $FAIL 项检查失败，建议运行 'bash bootstrap.sh' 进行修复${D}"
+    echo ""
+    echo "  如果问题持续（如 ZCode 超时），按以下顺序排查："
+    echo "    1. bash bootstrap.sh --diagnose（阶段三）→ 确认 TUN 未开"
+    echo "    2. bash bootstrap.sh --diagnose（阶段四）→ 确认 DNS 已国内化"
+    echo "    3. bash bootstrap.sh --diagnose（阶段五）→ 确认 ZCode 域名直连正常"
+    echo "    4. open -a 'Clash Verge' → 确认 Clash 在运行"
+    exit 1
+  elif [ "$WARN" -gt 0 ]; then
+    echo "${Y}有 $WARN 项警告，部分配置可进一步优化${D}"
+    echo "  运行 'bash bootstrap.sh' 可自动优化警告项"
+    exit 0
   else
-    echo "⚠️  部分检查失败，请查看上面 ❌ 项并运行 'bash bootstrap.sh' 修复。"
+    echo "${G}${BOLD}全部检查通过，网络配置状态优秀${D}"
+    exit 0
   fi
-  exit "$DIAG_FAIL"
+  # 恢复严格模式
+  set -euo pipefail
 fi
 
 OS="$(uname)"
