@@ -77,8 +77,6 @@ if ($SkipDNS -or $CI) {
     Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses "223.5.5.5","119.29.29.29"
     Write-Host "  $($_.Name) → 223.5.5.5 119.29.29.29"
   }
-} else {
-  Write-Host "  跳过 (-SkipDNS)"
 }
 
 Write-Host ""
