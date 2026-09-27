@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 兜底：仓库中混入订阅 token / 私有主机名即失败
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for private artifacts
+        run: |
+          PATTERNS='2236067|22619|vless://|vmess://|trojan://|ss://[A-Za-z0-9]|hysteria|subscribe\?token|/api/v1/client/subscribe'
+          # 排除 .github：扫描模式字符串本身写在本文件里，会自匹配
+          if grep -rniE "$PATTERNS" --exclude-dir=.git --exclude-dir=.github \
+             --include='*.sh' --include='*.ps1' --include='*.yaml' --include='*.yml' --include='*.js' --include='*.md' .; then
+            echo "::error::发现疑似私密信息（订阅串/私有节点）"; exit 1
+          else
+            echo "私密信息扫描通过"
+          fi
+
+  bootstrap-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bootstrap.sh --ci
+        run: bash bootstrap.sh --ci
+      - name: Verify shell block & mirrors
+        run: |
+          grep -q ">>> netroamer proxy >>>" ~/.zshrc
+          grep -q ">>> netroamer proxy >>>" ~/.bashrc
+          bash -ic 'type proxy_on proxy_off gh_mirror_on gh_mirror_off'
+          if command -v npm >/dev/null 2>&1; then
+            [ "$(npm config get registry)" = "https://registry.npmmirror.com" ]
+          fi
+          [ -f ~/.config/pip/pip.conf ] && grep -q tuna.tsinghua ~/.config/pip/pip.conf
+          [ -f ~/.cargo/config.toml ] && grep -q rsproxy ~/.cargo/config.toml
+          echo "验证通过"
+
+  bootstrap-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bootstrap.ps1 -CI (PowerShell)
+        shell: pwsh
+        run: ./bootstrap.ps1 -CI
+      - name: Verify (PowerShell)
+        shell: pwsh
+        run: |
+          $reg = npm config get registry
+          if ($reg -ne "https://registry.npmmirror.com") { throw "npm registry 未生效: $reg" }
+          $noProxy = [Environment]::GetEnvironmentVariable("NO_PROXY", "User")
+          if ($noProxy -notlike "*bigmodel.cn*") { throw "NO_PROXY 未写入用户环境变量" }
+          Write-Host "PowerShell 验证通过"
+      - name: Cross-run bootstrap.sh --ci under git-bash
+        shell: bash
+        run: |
+          bash bootstrap.sh --ci
+          grep -q ">>> netroamer proxy >>>" ~/.bashrc
+          bash -ic 'type proxy_on'
+          echo "git-bash 交叉验证通过"

@@ -1,0 +1,6 @@
+# 本地工具与备份产物，不入库
+.mimosa/
+*.bak.*
+*.bak
+*.tmp
+.DS_Store

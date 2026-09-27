@@ -1,0 +1,23 @@
+# netroamer Clash 规则增强 —— 订阅右键「编辑规则」，粘贴为 prepend 块
+# 三层直连保护的第 2 层；顺序即优先级，PROCESS-NAME 最先
+prepend:
+  # AI 开发工具进程级直连（任何域名兜底）
+  - PROCESS-NAME-REGEX,(?i)zcode,DIRECT
+  # ZCode / AI 服务域名
+  - DOMAIN-SUFFIX,vectide.cn,DIRECT
+  - DOMAIN-SUFFIX,bigmodel.cn,DIRECT
+  - DOMAIN-SUFFIX,zhipuai.cn,DIRECT
+  - DOMAIN-SUFFIX,z.ai,DIRECT
+  - DOMAIN-SUFFIX,hf-mirror.com,DIRECT
+  # Tailscale 控制面与 DERP 直连
+  - DOMAIN-SUFFIX,tailscale.com,DIRECT
+  - DOMAIN-SUFFIX,tailscale.io,DIRECT
+  - DOMAIN-SUFFIX,ts.net,DIRECT
+  # Loyalsoldier 基础分流（rule-providers 见 rules-merge.yaml；direct/greatfire/cncidr
+  # 若订阅自带同名 provider 则此处直接复用）
+  - RULE-SET,private,本地直连
+  - RULE-SET,icloud,本地直连
+  - RULE-SET,apple,本地直连
+  - RULE-SET,direct,本地直连
+  - RULE-SET,greatfire,全球代理
+  - RULE-SET,cncidr,本地直连,no-resolve

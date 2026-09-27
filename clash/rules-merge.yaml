@@ -1,0 +1,21 @@
+# netroamer Clash Merge —— 订阅右键「编辑 Merge」，补充订阅缺失的 rule-providers
+# URL 走 gh-proxy.com 前缀加速 GitHub raw 下载（rule-provider 类型，非 HTTP 代理）
+rule-providers:
+  icloud:
+    type: http
+    behavior: domain
+    interval: 86400
+    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/icloud.txt
+    path: ./ruleset/icloud.yaml
+  apple:
+    type: http
+    behavior: domain
+    interval: 86400
+    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/apple.txt
+    path: ./ruleset/apple.yaml
+  cncidr:
+    type: http
+    behavior: ipcidr
+    interval: 86400
+    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/cncidr.txt
+    path: ./ruleset/cncidr.yaml
