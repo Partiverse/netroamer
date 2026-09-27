@@ -42,6 +42,7 @@ netroamer/
 
 ```bash
 bash bootstrap.sh              # shell 代理块 + 镜像 + DNS + 看门狗
+bash bootstrap.sh --diagnose   # 只读诊断：检查端口/进程/代理状态/DNS/镜像/连通性
 bash bootstrap.sh --no-dns     # 不动 DNS（如公司机）
 bash bootstrap.sh --no-watchdog
 ```

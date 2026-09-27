@@ -2,12 +2,13 @@
 # netroamer —— macOS / Linux 中国网络开发环境一键配置
 # 原则见 README.md：TUN 永不开启、镜像优先、ZCode 三层直连、DNS 国内化、监控自愈
 # 幂等：可重复执行；被改文件均带时间戳备份
-# 用法：bash bootstrap.sh [--no-dns] [--no-watchdog] [--dns] [--ci]
+# 用法：bash bootstrap.sh [--diagnose] [--no-dns] [--no-watchdog] [--dns] [--ci]
 set -euo pipefail
 
-NO_DNS=false; NO_WATCHDOG=false; FORCE_DNS=false; CI=false
+NO_DNS=false; NO_WATCHDOG=false; FORCE_DNS=false; CI=false; DIAGNOSE=false
 for arg in "$@"; do
   case "$arg" in
+    --diagnose) DIAGNOSE=true ;;
     --no-dns) NO_DNS=true ;;
     --no-watchdog) NO_WATCHDOG=true ;;
     --dns) FORCE_DNS=true ;;          # Linux 上显式要求写 DNS（需 sudo）
@@ -15,6 +16,159 @@ for arg in "$@"; do
     *) echo "未知参数: $arg"; exit 1 ;;
   esac
 done
+
+# ---------------------------------------------------------------
+# 诊断模式：只读检查，不做任何修改
+# ---------------------------------------------------------------
+if [ "$DIAGNOSE" = true ]; then
+  DIAG_FAIL=0
+  diag() { local ok=$1; local msg=$2; if [ "$ok" = 0 ]; then echo "  ✅ $msg"; else echo "  ❌ $msg"; DIAG_FAIL=1; fi; }
+  warn() { echo "  ⚠️  $1"; }
+
+  echo "=== netroamer 网络诊断 ==="
+  PORT="${PROXY_PORT:-7897}"
+
+  # 1. 端口连通性
+  echo "--- 1. 代理端口 (:$PORT) ---"
+  if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
+    exec 3>&- 3<&-
+    diag 0 "端口 $PORT 已开放"
+  elif nc -z -w 2 127.0.0.1 $PORT 2>/dev/null; then
+    diag 0 "端口 $PORT 已开放（nc 检测）"
+  else
+    diag 1 "端口 $PORT 未监听——Clash/mihomo 是否在运行？"
+  fi
+
+  # 2. Clash/mihomo 进程
+  echo "--- 2. 核心进程 ---"
+  CORE=$(pgrep -fl '(verge-mihomo|mihomo)' 2>/dev/null | grep -v pgrep | head -1)
+  if [ -n "$CORE" ]; then
+    diag 0 "核心进程运行中"
+    echo "    $(echo "$CORE" | cut -c1-80)"
+  else
+    diag 1 "未检测到 verge-mihomo/mihomo 进程"
+  fi
+
+  # 3. 系统代理状态
+  echo "--- 3. 系统代理（PAC）---"
+  if [ "$(uname)" = "Darwin" ]; then
+    PROXY_ENABLED=$(networksetup -getwebproxy Wi-Fi 2>/dev/null | awk '/^Enabled:/{print $2}')
+    PAC_ENABLED=$(networksetup -getproxybypassdomains "Wi-Fi" 2>/dev/null | head -1)
+    if [ "$PROXY_ENABLED" = "Yes" ]; then
+      diag 0 "Web/HTTPS 代理已开启"
+    else
+      warn "Web/HTTPS 代理未开启——浏览器流量可能直连"
+    fi
+  else
+    # Linux: 检查环境变量
+    if [ -n "$HTTP_PROXY" ] || [ -n "$http_proxy" ]; then
+      diag 0 "检测到代理环境变量 HTTP_PROXY=${HTTP_PROXY:-$http_proxy}"
+    else
+      warn "未检测到 HTTP_PROXY 环境变量（可能需要先 source rc 文件）"
+    fi
+  fi
+
+  # 4. TUN 模式（应关闭）
+  echo "--- 4. TUN 模式 ---"
+  CVR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+  if [ -f "$CVR/verge.yaml" ]; then
+    if grep -E '^\s+enable_tun_mode:\s*true|^\s+enable:\s*true' "$CVR/verge.yaml" 2>/dev/null | grep -v 'false' | grep -q .; then
+      warn "检测到 TUN 已开启"
+      echo "    ⚠️  TUN 模式与 ZCode 直连冲突，建议关闭（verge.yaml: enable_tun_mode: false）"
+    else
+      diag 0 "TUN 模式未开启（正常）"
+    fi
+  else
+    warn "未找到 Clash Verge 配置文件（Clash Verge Rev 是否已安装？）"
+  fi
+
+  # 5. DNS 配置
+  echo "--- 5. DNS ---"
+  if [ "$(uname)" = "Darwin" ]; then
+    DNS_SERVERS=$(networksetup -getdnsservers "Wi-Fi" 2>/dev/null | grep -v "There aren't" | tr '\n' ' ')
+    if echo "$DNS_SERVERS" | grep -q "223.5.5.5\|119.29.29.29"; then
+      diag 0 "DNS 已国内化: $DNS_SERVERS"
+    elif [ -n "$DNS_SERVERS" ]; then
+      warn "DNS 未国内化，当前: $DNS_SERVERS"
+      echo "    运行: networksetup -setdnsservers Wi-Fi 223.5.5.5 119.29.29.29"
+    fi
+  elif [ "$(uname)" = "Linux" ]; then
+    if command -v resolvectl >/dev/null 2>&1; then
+      DNS=$(resolvectl status 2>/dev/null | awk '/DNS Servers:/{print $3; exit}')
+      if [ -n "$DNS" ]; then
+        if echo "$DNS" | grep -q "223.5.5.5\|119.29.29.29"; then
+          diag 0 "DNS 已国内化: $DNS"
+        else
+          warn "DNS 未国内化，当前: $DNS"
+        fi
+      fi
+    fi
+  fi
+
+  # 6. 国内直连
+  echo "--- 6. 国内直连测试 ---"
+  DOMESTIC=$(curl -s --noproxy '*' -o /dev/null -w "%{http_code}" --max-time 8 "https://open.bigmodel.cn" 2>/dev/null)
+  if [[ "$DOMESTIC" == 2* || "$DOMESTIC" == 3* ]]; then
+    diag 0 "open.bigmodel.cn 直连正常 (HTTP $DOMESTIC)"
+  else
+    diag 1 "open.bigmodel.cn 直连异常 (HTTP $DOMESTIC)——检查网络/DNS"
+  fi
+
+  # 7. 代理出口
+  echo "--- 7. 代理出口测试 ---"
+  FOREIGN=""
+  if nc -z -w 1 127.0.0.1 $PORT 2>/dev/null; then
+    FOREIGN=$(curl -s -x "http://127.0.0.1:$PORT" -o /dev/null -w "%{http_code}" --max-time 10 \
+      "https://www.apple.com/library/test/success.html" 2>/dev/null) || true
+    if [ "${FOREIGN:-}" = "200" ]; then
+      diag 0 "代理出口正常（apple.com HTTP ${FOREIGN}）"
+    else
+      warn "代理出口异常（apple.com HTTP ${FOREIGN:-未响应}）——代理节点可能故障"
+    fi
+  else
+    warn "跳过代理测试：端口 $PORT 未监听"
+  fi
+
+  # 8. ZCode 关键域名 NO_PROXY 覆盖
+  echo "--- 8. NO_PROXY 关键域名 ---"
+  NO_PROXY_VAL=""
+  if [ -n "${NO_PROXY:-}" ]; then
+    NO_PROXY_VAL="$NO_PROXY"
+  elif [ -f ~/.zshrc ]; then
+    NO_PROXY_VAL=$(grep -m1 'NO_PROXY=' ~/.zshrc 2>/dev/null | sed 's/.*NO_PROXY=//; s/"//g; s/'\''//g' | awk '{print $1}')
+  fi
+  ZCODE_DOMAINS="bigmodel.cn vectide.cn zhipuai.cn z.ai hf-mirror.com"
+  ZCODE_MISSING=""
+  for dom in $ZCODE_DOMAINS; do
+    if [ -n "$NO_PROXY_VAL" ] && echo "$NO_PROXY_VAL" | grep -q "$dom"; then
+      :
+    else
+      ZCODE_MISSING="$ZCODE_MISSING $dom"
+    fi
+  done
+  if [ -n "$ZCODE_MISSING" ]; then
+    warn "NO_PROXY 缺少:${ZCODE_MISSING}"
+  else
+    diag 0 "ZCode 关键域名均已纳入 NO_PROXY"
+  fi
+
+  # 9. 镜像配置
+  echo "--- 9. 包管理器镜像 ---"
+  PIP_OK=$(grep -q "pypi.tuna.tsinghua.edu.cn" "$HOME/.config/pip/pip.conf" 2>/dev/null && echo "1" || echo "0")
+  [ "$PIP_OK" = "1" ] && diag 0 "pip → 清华 TUNA" || warn "pip 未配置镜像（可能走代理）"
+  CARGO_OK=$(grep -q "rsproxy" "$HOME/.cargo/config.toml" 2>/dev/null && echo "1" || echo "0")
+  [ "$CARGO_OK" = "1" ] && diag 0 "cargo → 字节 rsproxy" || warn "cargo 未配置镜像"
+  NPM_OK=$(npm config get registry 2>/dev/null | grep -q "npmmirror" && echo "1" || echo "0")
+  [ "$NPM_OK" = "1" ] && diag 0 "npm → npmmirror" || warn "npm 未配置镜像"
+
+  echo ""
+  if [ "$DIAG_FAIL" = 0 ]; then
+    echo "✅ 所有检查通过，网络状态正常。"
+  else
+    echo "⚠️  部分检查失败，请查看上面 ❌ 项并运行 'bash bootstrap.sh' 修复。"
+  fi
+  exit "$DIAG_FAIL"
+fi
 
 OS="$(uname)"
 TS="$(date +%Y%m%d-%H%M%S)"
