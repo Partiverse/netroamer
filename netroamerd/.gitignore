@@ -1,0 +1,4 @@
+netroamerd
+*.db
+*.db-wal
+*.db-shm
