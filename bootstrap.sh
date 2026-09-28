@@ -655,7 +655,7 @@ echo "=== netroamer ($OS) ==="
 # ---------------------------------------------------------------
 # 0. 依赖自检：缺什么装什么（curl/git/nc）；装不了给出明确指引
 # ---------------------------------------------------------------
-echo "--- 0/5 依赖自检 ---"
+echo "--- 0/6 依赖自检 ---"
 PKG=""
 if command -v brew >/dev/null 2>&1; then PKG="brew"
 elif command -v apt-get >/dev/null 2>&1; then PKG="apt"
@@ -732,10 +732,28 @@ proxy_on() {
   export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,100.64.0.0/10"
   export no_proxy="\$NO_PROXY"; echo "proxy on (:${PROXY_PORT})"
 }
-proxy_off() { unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy; echo "proxy off"; }
-# git clone GitHub 走 gh-proxy.com URL 转发镜像（影响 push，push 前 gh_mirror_off）
-gh_mirror_on()  { git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"; echo "github via gh-proxy.com"; }
-gh_mirror_off() { git config --global --unset-all url."https://gh-proxy.com/https://github.com/".insteadOf 2>/dev/null; echo "github direct"; }
+proxy_off() {
+  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy
+  echo "proxy off"
+}
+# GitHub 读写全部走本地代理（push 前无需关闭，url.rewrite 仅影响 clone/fetch）
+gh_proxy_on() {
+  git config --global http.https://github.com.proxy "http://127.0.0.1:${PROXY_PORT}"
+  echo "github push via proxy (:${PROXY_PORT})"
+}
+gh_proxy_off() {
+  git config --global --unset http.https://github.com.proxy 2>/dev/null
+  echo "github push direct"
+}
+# git clone 读操作走 gh-proxy.com URL 镜像（可与 gh_proxy_on 共存）
+gh_mirror_on() {
+  git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
+  echo "github clone via gh-proxy.com"
+}
+gh_mirror_off() {
+  git config --global --unset-all url."https://gh-proxy.com/https://github.com/".insteadOf 2>/dev/null
+  echo "github clone direct"
+}
 # <<< netroamer proxy <<<
 EOF
 )
@@ -758,7 +776,7 @@ apply_block() {  # $1=rc 文件
   printf '\n%s\n' "$PROXY_BLOCK" >> "$rc"
   echo "  已写入: $rc"
 }
-echo "--- 1/5 shell 代理块 ---"
+echo "--- 1/6 shell 代理块 ---"
 apply_block "$HOME/.zshrc"
 apply_block "$HOME/.bashrc"
 
@@ -766,7 +784,7 @@ apply_block "$HOME/.bashrc"
 # 2. 包管理器镜像（镜像优先原则；实测 11-27 MB/s vs 节点 10-20 KB/s）
 #    工具链本身不代装（体积大），检测到哪个配哪个；都没有也会在末尾提示
 # ---------------------------------------------------------------
-echo "--- 2/5 包管理器镜像 ---"
+echo "--- 2/6 包管理器镜像 ---"
 TOOLCHAIN_SEEN=0
 if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
   mkdir -p "$HOME/.config/pip"
@@ -774,8 +792,9 @@ if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
   cat > "$HOME/.config/pip/pip.conf" <<'EOF'
 [global]
 index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+extra-index-url = https://mirrors.aliyun.com/pypi/simple
 EOF
-  echo "  pip → 清华 TUNA"; TOOLCHAIN_SEEN=1
+  echo "  pip → 清华 TUNA + 阿里云备用"; TOOLCHAIN_SEEN=1
 fi
 if command -v cargo >/dev/null 2>&1 || [ -d "$HOME/.cargo" ]; then
   bak "$HOME/.cargo/config.toml"
@@ -789,6 +808,13 @@ git-fetch-with-cli = true
 EOF
   echo "  cargo → 字节 rsproxy (sparse)"; TOOLCHAIN_SEEN=1
 fi
+# rustup 自身（独立于 cargo）走字节镜像，避免 rustup update 卡在 static.rust-lang.org
+if command -v rustup >/dev/null 2>&1; then
+  export RUSTUP_DIST_SERVER=https://rsproxy.cn
+  export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+  rustup set RUSTUP_DIST_SERVER https://rsproxy.cn 2>/dev/null || true
+  echo "  rustup → 字节 rsproxy.cn"
+fi
 if command -v go >/dev/null 2>&1; then
   go env -w GOPROXY=https://goproxy.cn,direct
   echo "  go → goproxy.cn"; TOOLCHAIN_SEEN=1
@@ -797,12 +823,70 @@ if command -v npm >/dev/null 2>&1; then
   npm config set registry https://registry.npmmirror.com
   echo "  npm → npmmirror"; TOOLCHAIN_SEEN=1
 fi
+# Homebrew bottles 走 gh-proxy.com，避免 --cask 从 GitHub 直连下载极慢
+if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+  # 写入 zshrc（brew 启动时会 source）
+  HB_MARKER="# netroamer: homebrew via gh-proxy"
+  if ! grep -q "$HB_MARKER" "$HOME/.zshrc" 2>/dev/null; then
+    cat >> "$HOME/.zshrc" <<'HBMARKER'
+
+# netroamer: homebrew via gh-proxy
+export HOMEBREW_BREW_GIT_REMOTE="https://gh-proxy.com/https://github.com/Homebrew/brew.git"
+export HOMEBREW_CORE_GIT_REMOTE="https://gh-proxy.com/https://github.com/Homebrew/homebrew-core.git"
+export HOMEBREW_API_DOMAIN="https://gh-proxy.com/https://formulae.brew.sh/api"
+export HOMEBREW_BOTTLE_DOMAIN="https://ghfast.cloud"
+HBMARKER
+  fi
+  # 当前 shell 也设（本次 session 生效）
+  export HOMEBREW_BREW_GIT_REMOTE="https://gh-proxy.com/https://github.com/Homebrew/brew.git"
+  export HOMEBREW_CORE_GIT_REMOTE="https://gh-proxy.com/https://github.com/Homebrew/homebrew-core.git"
+  export HOMEBREW_API_DOMAIN="https://gh-proxy.com/https://formulae.brew.sh/api"
+  export HOMEBREW_BOTTLE_DOMAIN="https://ghfast.cloud"
+  echo "  homebrew → gh-proxy.com (brew/git/api/bottles)"
+fi
 [ "$TOOLCHAIN_SEEN" = 0 ] && echo "  未检测到 pip/cargo/go/npm，跳过（装好工具链后重跑本脚本即可自动配置镜像）"
+
+# ---------------------------------------------------------------
+# 2.5 Docker Hub 镜像（DaoCloud 公开免费，无需注册；Docker Desktop 用户在 GUI 设置里配）
+# ---------------------------------------------------------------
+echo "--- 2b/6 Docker Hub 镜像 ---"
+DOCKER_CONF="/etc/docker/daemon.json"
+if [ "$OS" = "Darwin" ]; then
+  # macOS Docker Desktop：不改系统 daemon.json，在 GUI 里配
+  if command -v docker >/dev/null 2>&1; then
+    echo "  Docker Desktop macOS：请在 Docker Desktop → Settings → Docker Engine 中配置："
+    echo '  { "registry-mirrors": ["https://docker.m.daocloud.io"] }'
+  else
+    echo "  未检测到 docker，跳过（GUI 配置路径同上）"
+  fi
+elif [ "$OS" = "Linux" ]; then
+  # Linux systemd Docker daemon
+  if command -v docker >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$DOCKER_CONF")"
+    bak "$DOCKER_CONF" 2>/dev/null || true
+    # 保留现有配置（如果有），只追加 mirrors
+    if [ -f "$DOCKER_CONF" ] && grep -q "registry-mirrors" "$DOCKER_CONF" 2>/dev/null; then
+      echo "  registry-mirrors 已存在，跳过（手动检查 $DOCKER_CONF）"
+    else
+      cat > "$DOCKER_CONF" <<'EOF'
+{
+  "registry-mirrors": ["https://docker.m.daocloud.io"]
+}
+EOF
+      systemctl restart docker 2>/dev/null && echo "  Linux docker → DaoCloud" \
+        || echo "  docker daemon.json 已写入，需 sudo systemctl restart docker 生效"
+    fi
+  else
+    echo "  未检测到 docker，跳过"
+  fi
+else
+  echo "  跳过（非 macOS/Linux）"
+fi
 
 # ---------------------------------------------------------------
 # 3. DNS 国内化（223.5.5.5 + 119.29.29.29）
 # ---------------------------------------------------------------
-echo "--- 3/5 DNS ---"
+echo "--- 3/6 DNS ---"
 if [ "$OS" = "Darwin" ] && [ "$NO_DNS" = false ]; then
   for svc in $(networksetup -listallnetworkservices 2>/dev/null | tail -n +2); do
     networksetup -setdnsservers "$svc" 223.5.5.5 119.29.29.29 >/dev/null 2>&1 \
@@ -825,7 +909,7 @@ fi
 # ---------------------------------------------------------------
 # 4. 看门狗（LaunchAgent / cron，每 5 分钟）
 # ---------------------------------------------------------------
-echo "--- 4/5 看门狗 ---"
+echo "--- 4/6 看门狗 ---"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "$NO_WATCHDOG" = false ]; then
   mkdir -p "$HOME/.local/bin"
@@ -870,7 +954,7 @@ fi
 # ---------------------------------------------------------------
 # 5. Clash 配置提示（PAC/规则无法安全自动写入，给出粘贴路径）+ 自检
 # ---------------------------------------------------------------
-echo "--- 5/5 Clash 手动步骤 ---"
+echo "--- 5/6 Clash 手动步骤 ---"
 if [ "$OS" = "Darwin" ]; then
   CVR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
   echo "  1. 安装 Clash Verge Rev: brew install --cask clash-verge-rev"
