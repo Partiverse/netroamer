@@ -746,7 +746,7 @@ done
 # 1. shell 代理块：写入 ~/.zshrc 与 ~/.bashrc（幂等标记块）
 #    自动探测 7897 端口活着才 export；含 proxy_on/off、GitHub 镜像开关
 # ---------------------------------------------------------------
-PROXY_BLOCK=$(cat <<EOF
+PROXY_BLOCK=$(cat <<'PROXYBLOCK'
 # >>> netroamer proxy >>>
 # 自动探测 Clash/mihomo 混合端口，活着才启用代理环境变量（国内域名三层直连的第 3 层）
 netroamer_port_open() {
@@ -808,7 +808,7 @@ gh_mirror_off() {
   echo "github clone direct"
 }
 # <<< netroamer proxy <<<
-EOF
+PROXYBLOCK
 )
 
 apply_block() {  # $1=rc 文件
