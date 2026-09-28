@@ -414,12 +414,22 @@ if [ "$DIAGNOSE" = true ]; then
       ZCODE_MISSING="$ZCODE_MISSING $dom"
     fi
   done
-  if [ -n "$ZCODE_MISSING" ]; then
-    warn "NO_PROXY 缺少以下域名：$ZCODE_MISSING"
-    echo "  这些域名可能经代理绕行（不影响直连，但不如直连快）"
-    if ask_fix "NO_PROXY 域名缺失" \
-      "重新运行 bash bootstrap.sh（会重建带完整域名的 rc 文件）" \
-      "bootstrap.sh 会写入包含全部 ZCode 域名的 NO_PROXY"; then
+  SEG_MISSING=""
+  for seg in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 198.18.0.0/15; do
+    if [ -n "$NO_PROXY_VAL" ] && echo "$NO_PROXY_VAL" | grep -q "$seg"; then
+      ok "NO_PROXY 包含内网段 $seg"
+    else
+      SEG_MISSING="$SEG_MISSING $seg"
+    fi
+  done
+  if [ -n "$ZCODE_MISSING" ] || [ -n "$SEG_MISSING" ]; then
+    [ -n "$ZCODE_MISSING" ] && warn "NO_PROXY 缺少域名：$ZCODE_MISSING"
+    [ -n "$SEG_MISSING" ] && warn "NO_PROXY 缺少内网段：$SEG_MISSING"
+    echo "  域名缺失=绕行变慢；内网段缺失=云元数据 169.254.169.254、Tailscale 100.64/10 等"
+    echo "  内网流量会被送进代理出口（泄漏风险，BentoML SSRF 同款教训）"
+    if ask_fix "NO_PROXY 不完整" \
+      "重新运行 bash bootstrap.sh（会重建带完整域名与内网段的 rc 文件）" \
+      "bootstrap.sh 会写入包含全部 ZCode 域名与内网段的 NO_PROXY"; then
       bash "$0" --no-dns --no-watchdog >/dev/null 2>&1 \
         && ok "rc 文件已更新（需新终端生效）" \
         || fail "bootstrap.sh 执行失败"
@@ -681,7 +691,7 @@ if [ "$OS" = "Linux" ] && grep -qi "microsoft\|wsl2" /proc/version 2>/dev/null; 
     export HTTPS_PROXY="http://${WINDOWS_HOST}:7897"
     export http_proxy="$HTTP_PROXY"
     export https_proxy="$HTTPS_PROXY"
-    export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com,100.64.0.0/10"
+    export NO_PROXY="localhost,127.0.0.0/8,127.0.0.1,::1,.local,.lan,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,198.18.0.0/15,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com"
     export no_proxy="$NO_PROXY"
     echo "  ${G}✔ 已从 /etc/resolv.conf 推算 Windows IP: $WINDOWS_HOST${D}"
   fi
@@ -757,14 +767,14 @@ if netroamer_port_open; then
   export HTTP_PROXY="http://127.0.0.1:${PROXY_PORT}" HTTPS_PROXY="http://127.0.0.1:${PROXY_PORT}"
   export http_proxy="\$HTTP_PROXY" https_proxy="\$HTTPS_PROXY"
   export ALL_PROXY="socks5://127.0.0.1:${PROXY_PORT}" all_proxy="\$ALL_PROXY"
-  export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com, volcengine.com,100.64.0.0/10"
+  export NO_PROXY="localhost,127.0.0.0/8,127.0.0.1,::1,.local,.lan,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,198.18.0.0/15,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com"
   export no_proxy="\$NO_PROXY"
 fi
 proxy_on() {
   export HTTP_PROXY="http://127.0.0.1:${PROXY_PORT}" HTTPS_PROXY="http://127.0.0.1:${PROXY_PORT}"
   export http_proxy="\$HTTP_PROXY" https_proxy="\$HTTPS_PROXY"
   export ALL_PROXY="socks5://127.0.0.1:${PROXY_PORT}" all_proxy="\$ALL_PROXY"
-  export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com,100.64.0.0/10"
+  export NO_PROXY="localhost,127.0.0.0/8,127.0.0.1,::1,.local,.lan,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,198.18.0.0/15,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com"
   export no_proxy="\$NO_PROXY"; echo "proxy on (:${PROXY_PORT})"
 }
 proxy_off() {
@@ -1045,6 +1055,31 @@ else
   echo "  Linux: 运行 mihomo/clash 内核（配置中 TUN 关、external-controller 仅 unix socket）"
   echo "  规则模板同: $SCRIPT_DIR/clash/（PAC 由环境变量层替代）"
 fi
+
+# --- 5.5 安全自检：external-controller 暴露面 ---
+# 事故模式（research/04 §2）：0.0.0.0 绑定 / 无 secret → 恶意网页跨源调用本地 API 改配置 → RCE
+echo "--- 5.5/6 mihomo API 安全自检 ---"
+CTRL_WARN=0
+for CFG in \
+  "$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"/*.yaml \
+  "$HOME/.config/mihomo"/*.yaml \
+  "$HOME/.config/clash"/*.yaml; do
+  [ -f "$CFG" ] || continue
+  BINDING=$(grep -m1 -E '^[[:space:]]*external-controller:' "$CFG" 2>/dev/null \
+    | awk '{print $2}' | tr -d '"')
+  case "$BINDING" in
+    ""|127.0.0.1:*|localhost:*|unix:*) : ;;  # 未开 API、仅环回或 unix socket
+    *)
+      warn "external-controller 绑定 $BINDING（$(basename "$CFG")）：非环回地址可被局域网直取配置"
+      echo "  修复：改为 127.0.0.1:端口 并设置 secret"; CTRL_WARN=1 ;;
+  esac
+  if grep -q -E '^[[:space:]]*external-controller:' "$CFG" 2>/dev/null \
+    && ! grep -q -E "^[[:space:]]*secret:[[:space:]]*['\"]?[^'\"[:space:]]" "$CFG" 2>/dev/null; then
+    warn "mihomo API 无 secret（$(basename "$CFG")）：恶意网页可跨源调用本地 API 改配置（Clash Verge 1-Click RCE 同款模式）"
+    echo "  修复：配置中加 secret: <随机长串>（openssl rand -hex 16）"; CTRL_WARN=1
+  fi
+done
+[ "$CTRL_WARN" = 0 ] && ok "mihomo external-controller 未发现暴露配置（未检测到本地配置文件也视为通过）"
 
 # --- 收尾自检：rc 文件语法必须能过，否则立即报错退出 ---
 FAIL=0

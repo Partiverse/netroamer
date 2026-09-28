@@ -3,6 +3,18 @@
 prepend:
   # AI 开发工具进程级直连（任何域名兜底）
   - PROCESS-NAME-REGEX,(?i)zcode,DIRECT
+  # 内网/链路本地/CGNAT/fake-ip 段不可删直连（no-resolve 零 DNS 依赖；
+  # NO_PROXY 之外的 mihomo 侧兜底，防内网流量泄漏给代理出口，见 research/04 §3.5）
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR,198.18.0.0/15,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,lan,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - DOMAIN-SUFFIX,internal,DIRECT
   # ZCode / AI 服务域名
   - DOMAIN-SUFFIX,vectide.cn,DIRECT
   - DOMAIN-SUFFIX,bigmodel.cn,DIRECT

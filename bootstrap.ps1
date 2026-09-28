@@ -19,7 +19,7 @@ Write-Host "=== netroamer (Windows) ==="
 # ---------------------------------------------------------------
 if (-not $SkipEnv) {
   Write-Host "--- 1/3 环境变量 ---"
-  $noProxy = "localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,100.64.0.0/10"
+  $noProxy = "localhost,127.0.0.0/8,127.0.0.1,::1,.local,.lan,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,198.18.0.0/15,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai"
   [Environment]::SetEnvironmentVariable("HTTP_PROXY",  "http://127.0.0.1:$Port", "User")
   [Environment]::SetEnvironmentVariable("HTTPS_PROXY", "http://127.0.0.1:$Port", "User")
   [Environment]::SetEnvironmentVariable("ALL_PROXY",   "socks5://127.0.0.1:$Port", "User")
