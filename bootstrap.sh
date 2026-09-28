@@ -41,36 +41,84 @@ if [ "$DIAGNOSE" = true ]; then
     G=$(tput setaf 2 2>/dev/null)   # 绿色
     Y=$(tput setaf 3 2>/dev/null)   # 黄色
     B=$(tput setaf 4 2>/dev/null)   # 蓝色
+    C=$(tput setaf 6 2>/dev/null)   # 青色
+    M=$(tput setaf 5 2>/dev/null)   # 紫色
     D=$(tput sgr0 2>/dev/null)      # 默认
     BOLD=$(tput bold 2>/dev/null)
+    DIM=$(tput dim 2>/dev/null)
+    BAR_BG=$(tput setaf 8 2>/dev/null)  # 灰色（进度条背景）
   else
-    R="[ERR]"; G="[OK]"; Y="[WARN]"; B="[INFO]"; D=""; BOLD=""
+    R="[ERR]"; G="[OK]"; Y="[WARN]"; B="[INFO]"; C="[STEP]"; M=""; D=""; BOLD=""; DIM=""; BAR_BG=""
   fi
   PASS=0; FAIL=0; WARN=0; FIX_COUNT=0
+  TOTAL_STAGES=9
+  CURRENT_STAGE=0
 
-  info()  { echo "  ${B}▶ $1${D}"; }
-  ok()    { echo "  ${G}✓ $1${D}"; ((PASS++)) || true; }
-  fail()  { echo "  ${R}✗ $1${D}"; ((FAIL++)) || true; }
+  # ---- 进度条 ----
+  draw_bar() {
+    # $1=当前 $2=总数 $3=宽度
+    local cur=$1 total=$2 width=${3:-28}
+    local filled=$((cur * width / total))
+    local empty=$((width - filled))
+    printf "%s[%s%s%s] %d/%d%s" \
+      "$DIM" "$G" "$(printf '#%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null || echo "")" \
+      "$BAR_BG" "$(printf '.%.0s' $(seq 1 $empty 2>/dev/null) 2>/dev/null || echo "")" \
+      "$D" "$cur" "$total"
+  }
+
+  # ---- 旋转等待动画 ----
+  spin_pid=""
+  spin_char() { printf "%s" "$DIM"/; }
+  spin() {
+    # $1=PID $2=消息
+    local pid=$1 msg=$2
+    local chars="⠋⠙⠹⠸⠼⠴⠦⠧⠇�"
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+      local ch="${chars:$((i % ${#chars})):1}"
+      printf "\r  ${C}%s${D} %s %s  " "$ch" "$msg" "$(spin_char)"
+      i=$((i+1))
+      sleep 0.12
+    done
+    printf "\r  ${G}✓${D} %-40s\n" "$msg"
+  }
+
+  info()  { echo "  ${C}▸ $1${D}"; }
+  ok()    { echo "  ${G}✔ $1${D}"; ((PASS++)) || true; }
+  fail()  { echo "  ${R}✖ $1${D}"; ((FAIL++)) || true; }
   warn()  { echo "  ${Y}⚠ $1${D}"; ((WARN++)) || true; }
-  rule()  { echo "${BOLD}=== $1 ===${D}"; }
+  rule()  {
+    CURRENT_STAGE=$((CURRENT_STAGE + 1))
+    local stage=$CURRENT_STAGE
+    local title="$1"
+    local bar=$(draw_bar $stage $TOTAL_STAGES)
+    echo ""
+    echo "${BOLD}${C}┌──────────────────────────────────────────────┐${D}"
+    printf "  ${BOLD}${C}│ %-44s │${D}\n" "$(draw_bar $stage $TOTAL_STAGES) ${BOLD}$title${D}"
+    echo "${BOLD}${C}└──────────────────────────────────────────────┘${D}"
+  }
 
   # ---- 交互确认（CI 模式下自动跳过）----
   ask_fix() {
     # $1=检查名 $2=修复命令 $3=说明
+    local check_name="$1" fix_cmd="$2" explanation="$3"
     echo ""
-    echo "  ${Y}发现问题：$1${D}"
-    [ -n "$3" ] && echo "  $3"
-    echo "  命令：${B}$2${D}"
+    echo "  ${BAR_BG}┄${D} ${Y}⚡ 发现问题${D} ${BAR_BG}┄${D}"
+    echo ""
+    echo "  ${BOLD}${R}✖ $check_name${D}"
+    [ -n "$explanation" ] && echo "  ${DIM}说明：$explanation${D}"
+    echo "  ${DIM}命令：$fix_cmd${D}"
+    echo ""
     if [ "${CI:-false}" = "true" ]; then
-      echo "  [CI 模式：自动跳过]"
+      echo "  ${M}⬡ CI 模式：自动跳过${D}"
       return 1
     fi
-    echo -n "  是否自动修复？${BOLD}[Y/enter=修复 n=跳过]: ${D}"
+    echo -n "  ${BOLD}${G}▶ 是否自动修复？${D} [${G}Y${D}/enter=修复 ${R}n${D}=跳过] "
     local answer=""
     read -r answer 2>/dev/null || true
     case "$answer" in
-      n|n|N)  echo "  已跳过"; return 1 ;;
-      *)       echo "  执行修复..."; return 0 ;;
+      n|n|N)  echo "  ${DIM}已跳过${D}"; return 1 ;;
+      *)       echo "  ${G}▶ 执行修复...${D}"; return 0 ;;
     esac
   }
 
@@ -115,9 +163,11 @@ if [ "$DIAGNOSE" = true ]; then
   PROXY_PORT="${PROXY_PORT:-7897}"
   CVR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 
+  START_TIME=${START_TIME:-$(date +%s)}
   echo ""
   rule "netroamer 交互式网络诊断"
   echo "  系统: $(uname)  |  Shell: ${SHELL##*/}  |  代理端口: $PROXY_PORT"
+  echo "  ${DIM}开始时间: $(date '+%H:%M:%S')${D}"
   echo ""
 
   # ============================================================
@@ -521,28 +571,74 @@ TOML
   # ============================================================
   # 汇总报告
   # ============================================================
-  rule "诊断汇总"
+  ELAPSED=$(( $(date +%s) - START_TIME ))
   echo ""
-  echo "  ${G}✓ 通过: $PASS${D}"
-  [ "$WARN" -gt 0 ] && echo "  ${Y}⚠ 警告: $WARN${D}"
-  [ "$FAIL" -gt 0 ] && echo "  ${R}✗ 失败: $FAIL${D}"
+  echo "${BOLD}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${D}"
+  echo "  ${BOLD}诊 断 汇 总${D}    ${dim}耗时: ${ELAPSED:-未知}s${D}"
+  echo "${BOLD}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${D}"
+  echo ""
+
+  # 分数条
+  local total=$((PASS + FAIL + WARN))
+  local ok_w=$((PASS * 28 / (total > 0 ? total : 1)))
+  local fail_w=$((FAIL * 28 / (total > 0 ? total : 1)))
+  local warn_w=$((WARN * 28 / (total > 0 ? total : 1)))
+  local bar=$(printf "%${ok_w}s" | tr ' ' '█')
+  local warn_bar=$(printf "%${warn_w}s" | tr ' ' '▄')
+  local fail_bar=$(printf "%${fail_w}s" | tr ' ' '▪')
+
+  echo "  ${G}█${D} ${G}通过  $PASS${D}    ${Y}▄${D} ${Y}警告  $WARN${D}    ${R}▪${D} ${R}失败  $FAIL${D}"
+  echo "  ${BAR_BG}┄${D}${G}${bar}${Y}${warn_bar}${R}${fail_bar}${D}${BAR_BG}                                                              ${D}"
+  echo ""
+
+  # 网络健康评分
+  local denom=$(( total > 0 ? total : 1 ))
+  local score=$(( (PASS * 100) / denom ))
+  if   [ "$score" -ge 90 ]; then
+    echo "  ${G}▶ 网络健康评分：$score/100${D}  ${G}优秀${D}  — 运行流畅，无需操作"
+  elif [ "$score" -ge 70 ]; then
+    echo "  ${Y}▶ 网络健康评分：$score/100${D}  ${Y}良好${D}  — 有 ${WARN} 项可优化，运行无碍"
+  elif [ "$score" -ge 40 ]; then
+    echo "  ${Y}▶ 网络健康评分：$score/100${D}  ${R}一般${D}  — 有 ${FAIL} 项需修复，可能影响 AI 工具"
+  else
+    echo "  ${R}▶ 网络健康评分：$score/100${D}  ${R}异常${D}  — 建议运行 ${BOLD}bash bootstrap.sh${D} 全面修复"
+  fi
   echo ""
 
   if [ "$FAIL" -gt 0 ]; then
-    echo "${R}${BOLD}有 $FAIL 项检查失败，建议运行 'bash bootstrap.sh' 进行修复${D}"
+    echo "  ${R}✖ 有 $FAIL 项检查失败：${D}"
     echo ""
-    echo "  如果问题持续（如 ZCode 超时），按以下顺序排查："
-    echo "    1. bash bootstrap.sh --diagnose（阶段三）→ 确认 TUN 未开"
-    echo "    2. bash bootstrap.sh --diagnose（阶段四）→ 确认 DNS 已国内化"
-    echo "    3. bash bootstrap.sh --diagnose（阶段五）→ 确认 ZCode 域名直连正常"
-    echo "    4. open -a 'Clash Verge' → 确认 Clash 在运行"
+    echo "  ${R}1.${D} ${R}阶段三（TUN 模式）${D}  — TUN 开启会导致 ZCode 等国内域名断连"
+    echo "      修复：关掉 Clash Verge 设置里的 TUN，重启 Clash"
+    echo ""
+    echo "  ${R}2.${D} ${R}阶段二（系统代理）${D}  — 浏览器流量直连，不受 Clash 规则保护"
+    echo "      修复：系统偏好设置 → 网络 → 高级 → 代理 → 开启 Web/HTTPS 代理"
+    echo ""
+    echo "  ${R}3.${D} ${R}阶段四（DNS）${D}  — DNS 污染/过慢导致域名解析失败"
+    echo "      修复：sudo networksetup -setdnsservers Wi-Fi 223.5.5.5 119.29.29.29"
+    echo ""
+    echo "  ${DIM}按任意键退出...${D}"
+    read -rsn1 2>/dev/null || true
     exit 1
+
   elif [ "$WARN" -gt 0 ]; then
-    echo "${Y}有 $WARN 项警告，部分配置可进一步优化${D}"
-    echo "  运行 'bash bootstrap.sh' 可自动优化警告项"
+    echo "  ${Y}⚠ 有 $WARN 项警告，部分配置可进一步优化：${D}"
+    echo ""
+    echo "  ${Y}1.${D} ${Y}阶段五（三层直连）${D}  — ZCode 域名可能未完全直连"
+    echo "      修复：bash bootstrap.sh（会重新写入 NO_PROXY / PAC）"
+    echo ""
+    echo "  ${Y}2.${D} ${Y}阶段七（路由表）${D}  — 路由表有残留 TUN 条目"
+    echo "      修复：重启 Clash Verge 可清除残留路由"
+    echo ""
+    echo "  运行 ${BOLD}bash bootstrap.sh${D} 可自动优化警告项"
+    echo ""
     exit 0
   else
-    echo "${G}${BOLD}全部检查通过，网络配置状态优秀${D}"
+    echo "${G}  ✔ 全部检查通过，网络配置状态优秀 ✔${D}"
+    echo ""
+    echo "  ${DIM}恭喜！你的网络环境已就绪，可以直接使用 ZCode / AI 工具。${D}"
+    echo "  ${DIM}提示：如有异常，运行 ${BOLD}bash bootstrap.sh --diagnose${D}${DIM} 重新诊断${D}"
+    echo ""
     exit 0
   fi
   # 恢复严格模式
