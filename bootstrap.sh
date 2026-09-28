@@ -784,16 +784,15 @@ gh_proxy_off() {
 gh_mirror_on() {
   # 按优先级尝试可用镜像，curl --max-time 5 测通即用
   local chosen="" prefix=""
-  local m1="gh-proxy.com" m2="ghproxy.cn" m3="gitclone.com"
   # 镜像一：gh-proxy.com
   if curl -s --noproxy '*' -o /dev/null --max-time 5 "https://gh-proxy.com" 2>/dev/null; then
-    chosen="$m1"; prefix="https://gh-proxy.com/https://github.com/"
+    chosen="gh-proxy.com"; prefix="https://gh-proxy.com/https://github.com/"
   # 镜像二：ghproxy.cn
   elif curl -s --noproxy '*' -o /dev/null --max-time 5 "https://ghproxy.cn" 2>/dev/null; then
-    chosen="$m2"; prefix="https://ghproxy.cn/github/"
+    chosen="ghproxy.cn"; prefix="https://ghproxy.cn/github/"
   # 镜像三：gitclone.com
   elif curl -s --noproxy '*' -o /dev/null --max-time 5 "https://gitclone.com" 2>/dev/null; then
-    chosen="$m3"; prefix="https://gitclone.com/github.com/"
+    chosen="gitclone.com"; prefix="https://gitclone.com/github.com/"
   fi
   if [ -n "$chosen" ] && [ -n "$prefix" ]; then
     git config --global url."${prefix}".insteadOf "https://github.com/"
