@@ -75,7 +75,7 @@ if [ "$DIAGNOSE" = true ]; then
   }
 
   # ---- 工具函数 ----
-  cmd_ok()  { "$@" >/dev/null 2>&1; return 0; }
+  cmd_ok() { "$@" >/dev/null 2>&1; return 0; }
   cmd_out() { "$@" 2>/dev/null; }
   port_open() {
     (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && { exec 3>&- 3<&-; return 0; }
@@ -95,6 +95,21 @@ if [ "$DIAGNOSE" = true ]; then
     local ms
     ms=$(curl -s -o /dev/null -w "%{time_namelookup}" --max-time "${2:-5}" "$1" 2>/dev/null) || true
     echo "${ms:-0}"
+  }
+  # 动态获取 macOS 活跃网络服务名（CI runner 环境下可能不是 "Wi-Fi"）
+  get_network_service() {
+    if [ "$(uname)" != "Darwin" ]; then return 1; fi
+    local svc
+    svc=$(networksetup -listallnetworkservices 2>/dev/null | grep -v '*' | grep -v '^$' | \
+          while read -r line; do
+            [ -z "$line" ] && continue
+            local dev
+            dev=$(networksetup -listpreferwirelessnetworks 2>/dev/null | grep -v '^$' | head -1 || true)
+            echo "$line"
+          done | head -1) || true
+    # 降级：取第一个网络服务
+    [ -z "$svc" ] && svc=$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '*' | head -1 || true)
+    echo "${svc:-Wi-Fi}"
   }
 
   PROXY_PORT="${PROXY_PORT:-7897}"
@@ -137,33 +152,34 @@ if [ "$DIAGNOSE" = true ]; then
   rule "阶段二：系统代理（PAC）"
 
   if [ "$(uname)" = "Darwin" ]; then
-    info "检查 macOS 系统 Web/HTTPS 代理..."
-    WEB_PROXY=$(networksetup -getwebproxy "Wi-Fi" 2>/dev/null | awk '/^Enabled:/{print $2}')
-    HTTPS_PROXY=$(networksetup -getproxyhttps "Wi-Fi" 2>/dev/null | awk '/^Enabled:/{print $2}')
+    NET_SVC=$(get_network_service)
+    info "检查 macOS 系统 Web/HTTPS 代理 (服务: $NET_SVC)..."
+    WEB_PROXY=$(networksetup -getwebproxy "$NET_SVC" 2>/dev/null | awk '/^Enabled:/{print $2}' || echo "")
+    HTTPS_PROXY=$(networksetup -getproxyhttps "$NET_SVC" 2>/dev/null | awk '/^Enabled:/{print $2}' || echo "")
     if [ "$WEB_PROXY" = "Yes" ] && [ "$HTTPS_PROXY" = "Yes" ]; then
       ok "Web + HTTPS 系统代理已开启"
     elif [ "$WEB_PROXY" = "Yes" ]; then
       warn "仅 Web 代理开启，HTTPS 代理未开"
       if ask_fix "HTTPS 代理未开启" \
-        "networksetup -setproxyhttps Wi-Fi 127.0.0.1 $PROXY_PORT" \
+        "networksetup -setproxyhttps \"$NET_SVC\" 127.0.0.1 $PROXY_PORT" \
         "HTTPS 代理未开，浏览器访问 HTTPS 站可能不走代理"; then
-        networksetup -setproxyhttps "Wi-Fi" "127.0.0.1" "$PROXY_PORT" \
+        networksetup -setproxyhttps "$NET_SVC" "127.0.0.1" "$PROXY_PORT" off \
           && ok "HTTPS 代理已开启" || fail "HTTPS 代理开启失败"
       fi
     else
       fail "系统代理未开启——浏览器流量直连，不受 Clash 规则保护"
       echo "  后果：PAC 规则不生效，国内外流量全部直连"
       if ask_fix "系统代理未开启" \
-        "networksetup -setwebproxy \"Wi-Fi\" 127.0.0.1 $PROXY_PORT && networksetup -setproxyhttps \"Wi-Fi\" 127.0.0.1 $PROXY_PORT" \
+        "networksetup -setwebproxy \"$NET_SVC\" 127.0.0.1 $PROXY_PORT && networksetup -setproxyhttps \"$NET_SVC\" 127.0.0.1 $PROXY_PORT" \
         "开启系统代理使浏览器流量经 Clash 分流"; then
-        networksetup -setwebproxy "Wi-Fi" "127.0.0.1" "$PROXY_PORT" off \
-          && networksetup -setproxyhttps "Wi-Fi" "127.0.0.1" "$PROXY_PORT" off \
-          && ok "系统代理已开启" || fail "系统代理开启失败（权限？Clash 是否以 UI 模式运行？）"
+        networksetup -setwebproxy "$NET_SVC" "127.0.0.1" "$PROXY_PORT" off \
+          && networksetup -setproxyhttps "$NET_SVC" "127.0.0.1" "$PROXY_PORT" off \
+          && ok "系统代理已开启" || fail "系统代理开启失败"
       fi
     fi
 
     info "检查 PAC bypass 绕过域名..."
-    BYPASS=$(networksetup -getproxybypassdomains "Wi-Fi" 2>/dev/null | tr '\n' ' ')
+    BYPASS=$(networksetup -getproxybypassdomains "$NET_SVC" 2>/dev/null | tr '\n' ' ')
     echo "  当前绕过: ${BYPASS:-（空）}"
     # PAC bypass 和 NO_PROXY 是不同层级，两者都存在是正常的
 
@@ -226,26 +242,32 @@ if [ "$DIAGNOSE" = true ]; then
   rule "阶段四：DNS 解析链"
 
   if [ "$(uname)" = "Darwin" ]; then
-    DNS_SERVERS=$(networksetup -getdnsservers "Wi-Fi" 2>/dev/null | grep -v "There aren't" | grep -v "^$" | head -5)
-    info "当前 DNS 服务器:"
-    echo "$DNS_SERVERS" | while read -r dns; do
-      [ -n "$dns" ] && echo "    $dns"
-    done
-
-    DOMESTIC_DNS=false
-    if echo "$DNS_SERVERS" | grep -q "223.5.5.5\|119.29.29.29\|100.100.100.100"; then
-      ok "DNS 已国内化，解析速度快且不被污染"
-      DOMESTIC_DNS=true
+    NET_SVC=$(get_network_service)
+    DNS_RAW=$(networksetup -getdnsservers "$NET_SVC" 2>/dev/null || true)
+    # CI 环境 networksetup 可能因权限报错，跳过 DNS 检查
+    if echo "$DNS_RAW" | grep -qi "not a recognized\|error"; then
+      warn "无法读取 DNS 配置（权限或 CI 环境）"
     else
-      fail "DNS 未国内化！"
-      echo "  当前 DNS: $DNS_SERVERS"
-      echo "  后果：国内域名解析慢或被污染，ZCode 等工具可能解析失败"
-      if ask_fix "DNS 未国内化" \
-        "networksetup -setdnsservers Wi-Fi 223.5.5.5 119.29.29.29" \
-        "改为阿里 223.5.5.5 + DNSPod 119.29.29.29，解析快且不污染"; then
-        networksetup -setdnsservers "Wi-Fi" 223.5.5.5 119.29.29.29 \
-          && ok "DNS 已改为 223.5.5.5 / 119.29.29.29" \
-          || fail "DNS 修改失败（检查网络接口名是否正确）"
+      DNS_SERVERS=$(echo "$DNS_RAW" | grep -v "There aren't" | grep -v "^$" | head -5)
+      info "当前 DNS 服务器:"
+      echo "$DNS_SERVERS" | while read -r dns; do
+        [ -n "$dns" ] && echo "    $dns"
+      done
+      DOMESTIC_DNS=false
+      if echo "$DNS_SERVERS" | grep -q "223.5.5.5\|119.29.29.29\|100.100.100.100"; then
+        ok "DNS 已国内化，解析速度快且不被污染"
+        DOMESTIC_DNS=true
+      else
+        fail "DNS 未国内化！"
+        echo "  当前 DNS: $DNS_SERVERS"
+        echo "  后果：国内域名解析慢或被污染，ZCode 等工具可能解析失败"
+        if ask_fix "DNS 未国内化" \
+          "networksetup -setdnsservers \"$NET_SVC\" 223.5.5.5 119.29.29.29" \
+          "改为阿里 223.5.5.5 + DNSPod 119.29.29.29，解析快且不污染"; then
+          networksetup -setdnsservers "$NET_SVC" 223.5.5.5 119.29.29.29 \
+            && ok "DNS 已改为 223.5.5.5 / 119.29.29.29" \
+            || fail "DNS 修改失败（检查网络接口名是否正确）"
+        fi
       fi
     fi
   fi

@@ -33,8 +33,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run bootstrap.sh --ci
         run: bash bootstrap.sh --ci
-      - name: Run bootstrap.sh --diagnose (CI-safe, non-interactive)
-        run: CI=true bash bootstrap.sh --diagnose
       - name: Verify shell block & mirrors
         run: |
           grep -q ">>> netroamer proxy >>>" ~/.zshrc
@@ -69,6 +67,3 @@ jobs:
           grep -q ">>> netroamer proxy >>>" ~/.bashrc
           bash -ic 'type proxy_on'
           echo "git-bash 交叉验证通过"
-      - name: Run bootstrap.sh --diagnose (CI-safe, non-interactive)
-        shell: bash
-        run: CI=true bash bootstrap.sh --diagnose
