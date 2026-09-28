@@ -254,15 +254,27 @@ if [ "$DIAGNOSE" = true ]; then
   rule "阶段三：TUN 模式"
 
   info "检查 Clash Verge TUN 配置..."
+  TUN_ENABLED=false
   if [ -f "$CVR/verge.yaml" ]; then
-    TUN_LINE=$(grep -n 'enable_tun_mode' "$CVR/verge.yaml" 2>/dev/null | grep -v '^#' | head -1 || true)
-    TUN_STACK=$(grep -n '^\s\+stack:' "$CVR/verge.yaml" 2>/dev/null | head -1 || true)
-    DNS_HIJACK=$(grep -n 'dns-hijack\|dns_hijack' "$CVR/verge.yaml" 2>/dev/null | grep -v '^#' | head -3 || true)
+    # 格式一：enable_tun_mode: true（Clash Verge 旧版）
+    if grep -q '^[[:space:]]*enable_tun_mode:[[:space:]]*true' "$CVR/verge.yaml" 2>/dev/null; then
+      TUN_ENABLED=true
+      TUN_LINE=$(grep -n '^[[:space:]]*enable_tun_mode:[[:space:]]*true' "$CVR/verge.yaml" 2>/dev/null | head -1)
+      TUN_FORMAT="enable_tun_mode"
+    fi
+    # 格式二：tun: { enable: true }（mihomo 新版块级格式）
+    if grep -E '^[[:space:]]*tun:' "$CVR/verge.yaml" 2>/dev/null | grep -qv '^\s*#'; then
+      # 检查 tun: 块内是否有 enable: true（跨行检测）
+      if awk '/^[[:space:]]*tun:/,/^[[:space:]]*[a-z]+:/' "$CVR/verge.yaml" 2>/dev/null | grep -qE '^\s*enable:\s*true\s*$'; then
+        TUN_ENABLED=true
+        TUN_FORMAT="tun { enable: true }"
+      fi
+    fi
 
-    if echo "$TUN_LINE" | grep -q 'true'; then
+    if [ "$TUN_ENABLED" = "true" ]; then
       fail "TUN 模式已开启！"
       echo "  文件: $CVR/verge.yaml"
-      echo "  行: ${TUN_LINE}"
+      echo "  格式: $TUN_FORMAT"
       echo ""
       echo "  ${R}这是 ZCode / AI 工具断网的根本原因！${D}"
       echo "  TUN 劫持全系统路由 + fake-ip DNS，把本应直连的国内流量"
@@ -270,18 +282,19 @@ if [ "$DIAGNOSE" = true ]; then
       echo "  导致 AI 开发工具连接超时。"
       echo ""
       if ask_fix "TUN 模式已开启" \
-        "sed -i '' 's/enable_tun_mode: true/enable_tun_mode: false/' $CVR/verge.yaml" \
+        "sed -i '' 's/enable_tun_mode: true/enable_tun_mode: false/' $CVR/verge.yaml && sed -i '' '/^[[:space:]]*tun:/,/^[[:space:]]*[a-z]+:/{s/enable: true/enable: false/}' $CVR/verge.yaml" \
         "关闭 TUN 后需重启 Clash Verge 生效"; then
-        sed -i '' 's/enable_tun_mode: true/enable_tun_mode: false/' "$CVR/verge.yaml" 2>/dev/null \
-          && ok "已关闭 TUN（enable_tun_mode: false），请重启 Clash Verge" \
-          || fail "修改 verge.yaml 失败（权限？）"
+        sed -i '' 's/enable_tun_mode: true/enable_tun_mode: false/' "$CVR/verge.yaml" 2>/dev/null
+        # mihomo 块级格式修复
+        awk '/^[[:space:]]*tun:/,/^[[:space:]]*[a-z]+:/{
+          if(/^\s*enable:\s*true/) { sub(/enable: true/, "enable: false") }
+          print
+        }' "$CVR/verge.yaml" > "$CVR/verge.yaml.tmp" && mv "$CVR/verge.yaml.tmp" "$CVR/verge.yaml" 2>/dev/null || true
+        ok "已关闭 TUN，请重启 Clash Verge"
       fi
     else
       ok "TUN 模式未开启（正常）"
-      [ -n "$TUN_STACK" ] && echo "  当前 stack: $(echo "$TUN_STACK" | awk '{print $2}')"
     fi
-
-    [ -n "$DNS_HIJACK" ] && echo "  DNS 劫持配置: $(echo "$DNS_HIJACK" | head -1 | cut -d: -f2- | tr -d ' ')"
   else
     warn "未找到 Clash Verge 配置文件（Clash Verge Rev 是否已安装？）"
   fi
@@ -652,6 +665,28 @@ bak() { [ -f "$1" ] && cp "$1" "$1.bak.$TS" && echo "  备份: $1.bak.$TS" || tr
 
 echo "=== netroamer ($OS) ==="
 
+# WSL2 检测：WSL2 下网络是 NAT 模式，代理需从 Windows 侧穿透
+if [ "$OS" = "Linux" ] && grep -qi "microsoft\|wsl2" /proc/version 2>/dev/null; then
+  WSL2=true
+  echo ""
+  echo "  ${Y}⚠ 检测到 WSL2${D}"
+  echo "  WSL2 代理环境变量需在 Windows 侧设置，或在 WSL2 内手动启动代理守护进程"
+  echo "  方案：Windows Clash Verge 开启 'Allow LAN'，WSL2 内设置："
+  echo "    export HTTP_PROXY=http://$(grep nameserver /etc/resolv.conf | awk '{print $2}'):7897"
+  echo "  本脚本将在 WSL2 内自动写入上述变量（若 Windows Clash 已开 LAN）"
+  # WSL2 从 Windows 获取宿主机 IP
+  WINDOWS_HOST=$(awk '/nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || true)
+  if [ -n "$WINDOWS_HOST" ]; then
+    export HTTP_PROXY="http://${WINDOWS_HOST}:7897"
+    export HTTPS_PROXY="http://${WINDOWS_HOST}:7897"
+    export http_proxy="$HTTP_PROXY"
+    export https_proxy="$HTTPS_PROXY"
+    export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com,100.64.0.0/10"
+    export no_proxy="$NO_PROXY"
+    echo "  ${G}✔ 已从 /etc/resolv.conf 推算 Windows IP: $WINDOWS_HOST${D}"
+  fi
+fi
+
 # ---------------------------------------------------------------
 # 0. 依赖自检：缺什么装什么（curl/git/nc）；装不了给出明确指引
 # ---------------------------------------------------------------
@@ -722,14 +757,14 @@ if netroamer_port_open; then
   export HTTP_PROXY="http://127.0.0.1:${PROXY_PORT}" HTTPS_PROXY="http://127.0.0.1:${PROXY_PORT}"
   export http_proxy="\$HTTP_PROXY" https_proxy="\$HTTPS_PROXY"
   export ALL_PROXY="socks5://127.0.0.1:${PROXY_PORT}" all_proxy="\$ALL_PROXY"
-  export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,100.64.0.0/10"
+  export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com, volcengine.com,100.64.0.0/10"
   export no_proxy="\$NO_PROXY"
 fi
 proxy_on() {
   export HTTP_PROXY="http://127.0.0.1:${PROXY_PORT}" HTTPS_PROXY="http://127.0.0.1:${PROXY_PORT}"
   export http_proxy="\$HTTP_PROXY" https_proxy="\$HTTPS_PROXY"
   export ALL_PROXY="socks5://127.0.0.1:${PROXY_PORT}" all_proxy="\$ALL_PROXY"
-  export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,100.64.0.0/10"
+  export NO_PROXY="localhost,127.0.0.1,::1,.local,.cn,npmmirror.com,hf-mirror.com,bigmodel.cn,vectide.cn,zhipuai.cn,z.ai,qwen.cn,deepseek.com,siliconflow.com,moonshot.cn,minimax.chat,dashscope.com,volcengine.com,100.64.0.0/10"
   export no_proxy="\$NO_PROXY"; echo "proxy on (:${PROXY_PORT})"
 }
 proxy_off() {
@@ -745,13 +780,32 @@ gh_proxy_off() {
   git config --global --unset http.https://github.com.proxy 2>/dev/null
   echo "github push direct"
 }
-# git clone 读操作走 gh-proxy.com URL 镜像（可与 gh_proxy_on 共存）
+# git clone 读操作走镜像（自动选最快的可用节点）
 gh_mirror_on() {
-  git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
-  echo "github clone via gh-proxy.com"
+  # 按优先级尝试可用镜像，curl --max-time 5 测通即用
+  local chosen="" prefix=""
+  local m1="gh-proxy.com" m2="ghproxy.cn" m3="gitclone.com"
+  # 镜像一：gh-proxy.com
+  if curl -s --noproxy '*' -o /dev/null --max-time 5 "https://gh-proxy.com" 2>/dev/null; then
+    chosen="$m1"; prefix="https://gh-proxy.com/https://github.com/"
+  # 镜像二：ghproxy.cn
+  elif curl -s --noproxy '*' -o /dev/null --max-time 5 "https://ghproxy.cn" 2>/dev/null; then
+    chosen="$m2"; prefix="https://ghproxy.cn/github/"
+  # 镜像三：gitclone.com
+  elif curl -s --noproxy '*' -o /dev/null --max-time 5 "https://gitclone.com" 2>/dev/null; then
+    chosen="$m3"; prefix="https://gitclone.com/github.com/"
+  fi
+  if [ -n "$chosen" ] && [ -n "$prefix" ]; then
+    git config --global url."${prefix}".insteadOf "https://github.com/"
+    echo "github clone via $chosen"
+  else
+    echo "github clone: 所有镜像均不可达，请检查代理连接"
+  fi
 }
 gh_mirror_off() {
   git config --global --unset-all url."https://gh-proxy.com/https://github.com/".insteadOf 2>/dev/null
+  git config --global --unset-all url."https://ghproxy.cn/github/".insteadOf 2>/dev/null
+  git config --global --unset-all url."https://gitclone.com/github.com/".insteadOf 2>/dev/null
   echo "github clone direct"
 }
 # <<< netroamer proxy <<<
@@ -821,6 +875,23 @@ fi
 if command -v npm >/dev/null 2>&1; then
   npm config set registry https://registry.npmmirror.com
   echo "  npm → npmmirror"; TOOLCHAIN_SEEN=1
+fi
+# conda / mamba 镜像（清华 + 腾讯云备用）
+if command -v conda >/dev/null 2>&1; then
+  conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main \
+    --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free \
+    --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge \
+    --set channel_alias https://mirrors.tuna.tsinghua.edu.cn/anaconda 2>/dev/null || true
+  echo "  conda → 清华 TUNA"; TOOLCHAIN_SEEN=1
+fi
+# yarn / pnpm 镜像
+if command -v yarn >/dev/null 2>&1; then
+  yarn config set registry https://registry.npmmirror.com 2>/dev/null || true
+  echo "  yarn → npmmirror"
+fi
+if command -v pnpm >/dev/null 2>&1; then
+  pnpm config set registry https://registry.npmmirror.com 2>/dev/null || true
+  echo "  pnpm → npmmirror"
 fi
 # Homebrew bottles 走 gh-proxy.com，避免 --cask 从 GitHub 直连下载极慢
 if [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
