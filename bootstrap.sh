@@ -812,7 +812,6 @@ fi
 if command -v rustup >/dev/null 2>&1; then
   export RUSTUP_DIST_SERVER=https://rsproxy.cn
   export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
-  rustup set RUSTUP_DIST_SERVER https://rsproxy.cn 2>/dev/null || true
   echo "  rustup → 字节 rsproxy.cn"
 fi
 if command -v go >/dev/null 2>&1; then
@@ -860,21 +859,29 @@ if [ "$OS" = "Darwin" ]; then
     echo "  未检测到 docker，跳过（GUI 配置路径同上）"
   fi
 elif [ "$OS" = "Linux" ]; then
-  # Linux systemd Docker daemon
-  if command -v docker >/dev/null 2>&1; then
-    mkdir -p "$(dirname "$DOCKER_CONF")"
-    bak "$DOCKER_CONF" 2>/dev/null || true
-    # 保留现有配置（如果有），只追加 mirrors
-    if [ -f "$DOCKER_CONF" ] && grep -q "registry-mirrors" "$DOCKER_CONF" 2>/dev/null; then
-      echo "  registry-mirrors 已存在，跳过（手动检查 $DOCKER_CONF）"
-    else
-      cat > "$DOCKER_CONF" <<'EOF'
+  # Linux systemd Docker daemon（CI runner 无 /etc 写权限，跳过）
+  if [ "$CI" = "true" ]; then
+    echo "  CI 模式跳过 Docker 配置（真实机器上会写入 /etc/docker/daemon.json）"
+  elif command -v docker >/dev/null 2>&1; then
+    if [ -w "$(dirname "$DOCKER_CONF")" ] 2>/dev/null; then
+      mkdir -p "$(dirname "$DOCKER_CONF")"
+      bak "$DOCKER_CONF" 2>/dev/null || true
+      if [ -f "$DOCKER_CONF" ] && grep -q "registry-mirrors" "$DOCKER_CONF" 2>/dev/null; then
+        echo "  registry-mirrors 已存在，跳过（手动检查 $DOCKER_CONF）"
+      else
+        cat > "$DOCKER_CONF" <<'EOF'
 {
   "registry-mirrors": ["https://docker.m.daocloud.io"]
 }
 EOF
-      systemctl restart docker 2>/dev/null && echo "  Linux docker → DaoCloud" \
-        || echo "  docker daemon.json 已写入，需 sudo systemctl restart docker 生效"
+        systemctl restart docker 2>/dev/null && echo "  Linux docker → DaoCloud" \
+          || echo "  docker daemon.json 已写入，需 sudo systemctl restart docker 生效"
+      fi
+    else
+      echo "  无写入权限（需 sudo）：$DOCKER_CONF"
+      echo "  手动执行：sudo tee $DOCKER_CONF > /dev/null <<'EOF'"
+      echo '  { "registry-mirrors": ["https://docker.m.daocloud.io"] }'
+      echo "  EOF"
     fi
   else
     echo "  未检测到 docker，跳过"
