@@ -783,7 +783,7 @@ gh_proxy_off() {
 # git clone 读操作走镜像（自动选最快的可用节点）
 gh_mirror_on() {
   # 按优先级尝试可用镜像，curl --max-time 5 测通即用
-  local chosen="" prefix=""
+  local chosen && chosen="" && local prefix && prefix=""
   # 镜像一：gh-proxy.com
   if curl -s --noproxy '*' -o /dev/null --max-time 5 "https://gh-proxy.com" 2>/dev/null; then
     chosen="gh-proxy.com"; prefix="https://gh-proxy.com/https://github.com/"
