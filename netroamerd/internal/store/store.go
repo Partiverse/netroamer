@@ -54,6 +54,17 @@ CREATE TABLE IF NOT EXISTS judgments (
   reverted INTEGER DEFAULT 0,
   params_hash TEXT DEFAULT ''     -- 判定参数指纹（P2-10：算法迭代可归因）
 );
+-- 主动探测留档（复测/预验证；节点身份不落库——§2 红线）
+CREATE TABLE IF NOT EXISTS probes (
+  ts INTEGER NOT NULL,
+  target TEXT NOT NULL,           -- 域名（retest/precheck）
+  side TEXT NOT NULL,             -- 'direct' | 'proxy'
+  purpose TEXT NOT NULL,          -- 'precheck' | 'retest'
+  lat_ms INTEGER,
+  ok INTEGER NOT NULL,
+  fail_kind TEXT DEFAULT ''       -- '' | 'timeout' | 'other'
+);
+CREATE INDEX IF NOT EXISTS idx_probes_target ON probes(target, purpose, ts);
 CREATE INDEX IF NOT EXISTS idx_judgments_target ON judgments(target, ts);
 `
 
@@ -305,6 +316,109 @@ func (s *Store) LastRevert(ctx context.Context, target string) (int64, error) {
 		`SELECT coalesce(max(ts),0) FROM judgments WHERE target = ? AND action = 'revert'`,
 		target).Scan(&ts)
 	return ts, err
+}
+
+// RevertCount 目标累计回滚次数（终态判定：≥3 永久仅通知——P0-2 收敛）。
+func (s *Store) RevertCount(ctx context.Context, target string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM judgments WHERE target = ? AND action = 'revert'`,
+		target).Scan(&n)
+	return n, err
+}
+
+// ActiveActions 未回滚且未满 24h 的直连动作（复测调度输入）。
+func (s *Store) ActiveActions(ctx context.Context, now time.Time, window time.Duration) ([]Judgment, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, kind, target, action, reason, reverted, coalesce(params_hash,'') FROM judgments
+		 WHERE kind = ? AND action = ? AND reverted = 0 AND ts >= ?
+		 ORDER BY ts`,
+		"slow_direct", "DIRECT on", now.Add(-window).Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Judgment
+	for rows.Next() {
+		var j Judgment
+		var rev int
+		if err := rows.Scan(&j.TS, &j.Kind, &j.Target, &j.Action, &j.Reason, &rev, &j.ParamsHash); err != nil {
+			return nil, err
+		}
+		j.Reverted = rev == 1
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// ProbeRecord 是 probes 表一行：一次主动探测的留档。
+type ProbeRecord struct {
+	TS       int64
+	Target   string
+	Side     string // direct | proxy
+	Purpose  string // precheck | retest
+	LatMs    *int64
+	OK       bool
+	FailKind string
+}
+
+func (s *Store) InsertProbes(ctx context.Context, recs []ProbeRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO probes(ts, target, side, purpose, lat_ms, ok, fail_kind) VALUES (?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, r := range recs {
+		var lat any
+		if r.LatMs != nil {
+			lat = *r.LatMs
+		}
+		ok := 0
+		if r.OK {
+			ok = 1
+		}
+		if _, err := stmt.ExecContext(ctx, r.TS, r.Target, r.Side, r.Purpose, lat, ok, r.FailKind); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ProbeSeries 取目标的探测序列（回滚滑动窗口判定输入）。
+func (s *Store) ProbeSeries(ctx context.Context, target, purpose string, since time.Time) ([]ProbeRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, target, side, purpose, lat_ms, ok, coalesce(fail_kind,'') FROM probes
+		 WHERE target = ? AND purpose = ? AND ts >= ? ORDER BY ts`,
+		target, purpose, since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProbeRecord
+	for rows.Next() {
+		var r ProbeRecord
+		var lat sql.NullInt64
+		var ok int
+		if err := rows.Scan(&r.TS, &r.Target, &r.Side, &r.Purpose, &lat, &ok, &r.FailKind); err != nil {
+			return nil, err
+		}
+		if lat.Valid {
+			v := lat.Int64
+			r.LatMs = &v
+		}
+		r.OK = ok == 1
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // migrateJudgments 幂等迁移：老库补 judgments.params_hash 列（P2-10）。

@@ -19,3 +19,12 @@ rule-providers:
     interval: 86400
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/cncidr.txt
     path: ./ruleset/cncidr.yaml
+  # netroamer:mount-begin —— netroamerd 自有直连 provider（W4）。
+  # path 中 REPLACE_ME 必须改为本机状态目录（如 /Users/xxx/.local/state/netroamer）；
+  # `netroamerd doctor` 会校验本段；卸载时按指纹清理。
+  netroamer-autodirect:
+    type: file
+    behavior: domain
+    interval: 300
+    path: /Users/REPLACE_ME/.local/state/netroamer/netroamer-autodirect.yaml
+  # netroamer:mount-end

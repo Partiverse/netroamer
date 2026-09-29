@@ -191,3 +191,32 @@ func TestRunDirectProbeGate(t *testing.T) {
 		t.Fatalf("代理探测失败应保守跳过: %+v", verdicts)
 	}
 }
+
+// 终态回归（独立复评 P0-2）：累计 3 次回滚 → 永久仅通知。
+func TestRunTerminalAfterThreeReverts(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := st.UpsertAgg(ctx, aggRows("term.cn", 4, 13, 1200, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := st.InsertJudgment(ctx, store.Judgment{TS: now.Add(-time.Duration(i+1) * time.Hour).Unix(),
+			Kind: "slow_direct", Target: "term.cn", Action: "revert", Reverted: true, ParamsHash: "h"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := &fakeAPI{delay: map[string]int{"DIRECT": 50, "HK-01": 900}}
+	verdicts, err := Run(ctx, depsFor(st, api, "HK-01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(verdicts) != 1 || verdicts[0].Action != "" || !strings.Contains(verdicts[0].Skipped, "终态") {
+		t.Fatalf("3 次回滚后应进终态仅通知: %+v", verdicts)
+	}
+}

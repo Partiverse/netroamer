@@ -162,6 +162,10 @@ func judgeHost(ctx context.Context, d Deps, now time.Time, host string, rows []s
 			return ev("用户 exempt 列表")
 		}
 	}
+	// 终态（独立复评 P0-2）：累计回滚 3 次 → 永久仅通知，状态机收敛
+	if rc, err := d.Store.RevertCount(ctx, host); err == nil && rc >= 3 {
+		return ev(fmt.Sprintf("终态：累计回滚 %d 次，仅通知不再自动动作", rc))
+	}
 	// 配额与冷却（P0-3：动作计数；回滚不计但设冷却）
 	if n, err := d.Store.CountActions(ctx, "slow_direct", host, now.Add(-p.QuotaWindow)); err == nil && n >= p.QuotaMax {
 		return ev(fmt.Sprintf("配额用尽（%d 天内已动作 %d 次）", int(p.QuotaWindow.Hours()/24), n))

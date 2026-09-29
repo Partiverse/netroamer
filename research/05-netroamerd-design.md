@@ -112,6 +112,18 @@ CREATE TABLE judgments (
   params_hash TEXT DEFAULT ''     -- 判定参数指纹：算法迭代后历史判定可归因
 );
 CREATE INDEX idx_judgments_target ON judgments(target, ts);
+
+-- 主动探测留档（复测/预验证/健康检查；节点身份按 §2 只存组内索引，不存名称）
+CREATE TABLE IF NOT EXISTS probes (
+  ts INTEGER NOT NULL,
+  target TEXT NOT NULL,           -- 域名（retest/precheck）或 组名×节点索引（health）
+  side TEXT NOT NULL,             -- 'direct' | 'proxy'
+  purpose TEXT NOT NULL,          -- 'precheck' | 'retest' | 'health'
+  lat_ms INTEGER,
+  ok INTEGER NOT NULL,
+  fail_kind TEXT DEFAULT ''       -- '' | 'dns' | 'timeout' | 'tls' | 'other'
+);
+CREATE INDEX idx_probes_target ON probes(target, purpose, ts);
 ```
 
 为什么不用 mihomo `/storage` 代替 SQLite：≤1MB 上限装不下 14 天样本；但 agent 仍用 `/storage` 存「上次动作摘要」供 mihomo 侧面板类工具读取。
@@ -134,14 +146,27 @@ CREATE INDEX idx_judgments_target ON judgments(target, ts);
 
 **动作**：把域名写入自有 rule-provider（`behavior: domain` 的 `netroamer-autodirect.yaml`）→ `PUT /providers/rules/{name}` 热载 → **`GET /rules` 回读验证域名可见**（修复 P1-8：不可见则指数退避重试，3 次失败回滚文件并告警，杜绝「文件已写、内核未载」的状态漂移）→ 记录 evidence（切换前窗口 P50/P95 vs 切换后 24h 复测序列）。
 
-**复测与回滚**（修复 P0-2：`/connections` 不含失败连接，被动观测测不出成功率）：
-- 切换后 24h 内**每小时经 DIRECT 主动探测**该域名（同口径），形成复测序列——复测器是回滚状态机的唯一事实来源，被动样本只做佐证；
-- 回滚条件：复测成功率 < 95%，或复测 EWMA 相对直连探测基线劣化 > 30%；
+**复测与回滚**（2026-09-29 二次修订，落实独立复评 P0-2）：
+- 切换后 24h 内**每小时经 DIRECT 主动探测**该域名（同口径），probes 表留档（purpose='retest'）——复测器是回滚状态机的唯一事实来源；
+- **探测成功 taxonomy**（P1-4）：mihomo delay test 以 TTFB 计——完成 TLS + 收到任意 HTTP 状态码即成功（`.cn` 域名返回 404/403 不算失败）；DNS 失败 / 超时 / TLS 失败 = 失败并按 fail_kind 留档；
+- 回滚判据（**滑动窗口，不用单点**）：最近 3 次连续失败 → 回滚；或最近 6 次中 ≥3 次失败 → 回滚。替代原「24 点 95%」（该口径下休眠唤醒 2 个孤立失败即误回滚）；
+- **代理变优退出**（P0-1③ 的完整版依赖 W5 节点健康追踪的组内索引身份，W4 先落地降级版）：动作后该域名的代理路径样本归零，故退出路径以「直连复测持续健康 + 判定满 7 天」为自然复核点重新评估，避免误动作永久化；
+- **终态**（P0-2）：同域名累计回滚 3 次（judgments reverted 计数）→ 永久降级「仅通知」，不再自动动作——状态机必须收敛；
 - 回滚 = provider 移除 + 热载 + 回读验证 + judgments 记录 `revert`；`netroamerd rollback` 支持手动一键撤销最近 N 条。
 
+**联动静默窗**（落实独立复评 P0-1）：
+- 任一坏节点切换（§4.2，W5 交付）发生后 T=2h 内，冻结 §4.1 对任何域名的自动动作（一个故障根因只允许一个自愈动作，其余转通知）——judgments 关联查询实现；
+- W4 过渡期（§4.2 尚未交付）的天然保护：条件 3 要求双侧探测均成功，节点劣化期代理侧探测劣化即无法通过；完整联动闸随 W5 落地。
+
 **配额与冷却**（修复 P0-3 震荡路径）：
-- **计数语义**：只有实际写 provider 的动作计数——同域名 7 天内最多 2 次；回滚**不计数**，但回滚立即设置同域名 **7 天冷却**（冷却期内即使配额剩余也不动作）；
-- **降级态退出条件**：冷却期满，且此后 3 个活跃桶不再满足条件 2（否则继续通知 + 建议，不自动动作）。
+- **计数语义**：只有实际写 provider 的动作计数——同域名 7 天内最多 2 次；回滚**不计数**，但回滚立即设置同域名 **7 天冷却**（冷却期内即使配额剩余也不动作）；热载失败回滚不消耗配额（文件已还原）；
+- **降级态退出条件**：冷却期满，且此后 3 个活跃桶不再满足条件 2（否则继续通知 + 建议，不自动动作）；
+- **终态**：累计回滚 3 次 → 永久仅通知（见复测与回滚）。
+
+**provider 挂载归属**（落实独立复评 P1-3）：
+- provider 文件本身不产生匹配——主配置需要 `rule-providers: netroamer-autodirect` 声明 + `RULE-SET,netroamer-autodirect,DIRECT` 一行；
+- 挂载段由本仓库模板交付（`clash/rules-merge.yaml` + `clash/rules-prepend.yaml`），带 `# netroamer:mount` 指纹注释标记边界；doctor 校验指纹存在、位置在用户 GEOSITE/catch-all 之前；
+- 卸载（W6）按指纹清除挂载段；W6 卸载验收同步改为「除 secret 与挂载指纹段外 diff 为空」。
 
 ### 4.2 坏节点自动切换
 
@@ -175,7 +200,7 @@ CREATE INDEX idx_judgments_target ON judgments(target, ts);
 | 周 | 任务 | 验收 |
 |---|---|---|
 | W3 | mihomo REST 客户端（version/rules/delay/connections）；同口径直连/代理探测器；豁免双闸（资格白名单 + 本地规则豁免 + 用户 allow/exempt 文件）；慢域名判定器（两层统计 + 配额/冷却状态机）；judgments 索引与 params_hash 迁移；collector 端点重发现 | 判定器回放数据集上豁免域名零动作；配额与冷却语义单测全覆盖 |
-| W4 | 自有 rule-provider 生成 + `PUT /providers/rules` 热载（强制 `GET /rules` 回读验证 + 失败退避重试）；24h 主动探测复测回滚状态机；`netroamerd rollback` | 热载后 `GET /rules` 可见且顺序正确；人工制造慢域名场景端到端走通；复测失败自动回滚且 evidence 完整 |
+| W4 | rule-provider 生成 + `PUT /providers/rules` 热载（`GET /providers/rules/{name}` ruleCount 对账 + `/rules` RULE-SET 行验证，失败退避重试）；24h 逐时直连复测 + 滑动窗口回滚状态机（连续 3 败或 6 中 3 败；终态 3 次回滚）；provider 挂载指纹（merge/prepend 模板 + doctor 校验）；`netroamerd rollback`；run 增加 `--actuate`（缺省影子模式：judge 只记录不动作） | 影子模式连续运行无写入；`--actuate` 下热载后 providers ruleCount 对账一致；人工制造慢域名端到端走通；复测失败自动回滚且 evidence 完整 |
 | W5 | 节点健康分（1.5× 握手阈值 + 指数惩罚 + 分阶段恢复）；`PUT /proxies` 切换 + 防震荡限制；尊重手动选择 | 坏节点场景 3 分钟内自动切换且 10 分钟内不回切 |
 | W6 | evidence 生成（JSON + Markdown）；系统通知接入；`netroamerd uninstall` 全量回滚（agent + LaunchAgent + 自有 provider + judgments 留档）；bootstrap.sh 集成安装；README/文档 | 卸载后 mihomo 配置与安装前等价（diff 为空） |
 

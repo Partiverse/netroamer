@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Partiverse/netroamer/netroamerd/internal/actuator"
 	"github.com/Partiverse/netroamer/netroamerd/internal/config"
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
 	"github.com/Partiverse/netroamer/netroamerd/internal/service"
@@ -65,6 +66,7 @@ func Run(ctx context.Context, out io.Writer) int {
 	findings = append(findings, checkExposure(home)...)
 	findings = append(findings, checkNoProxy(home)...)
 	findings = append(findings, checkDBPerms(cfg.DBPath)...)
+	findings = append(findings, checkProviderMount(home)...)
 	if st, err := service.Status(); err != nil {
 		findings = append(findings, Finding{WARN, "常驻服务状态", err.Error(), ""})
 	} else if strings.Contains(st, "未安装") {
@@ -160,6 +162,40 @@ func checkNoProxy(home string) []Finding {
 	}
 	return []Finding{{WARN, "NO_PROXY", detail,
 		"重新运行仓库根目录的 bootstrap.sh 重建 rc 文件（需新终端生效）"}}
+}
+
+// checkProviderMount 校验自有 rule-provider 的主配置挂载（独立复评 P1-3：
+// provider 文件不产生匹配，主配置必须有声明 + RULE-SET 行，且带指纹注释）。
+func checkProviderMount(home string) []Finding {
+	paths := config.MihomoConfigPaths(home)
+	vergeProfiles := filepath.Join(home, "Library", "Application Support",
+		"io.github.clash-verge-rev.clash-verge-rev", "profiles")
+	if entries, err := os.ReadDir(vergeProfiles); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
+				paths = append(paths, filepath.Join(vergeProfiles, e.Name()))
+			}
+		}
+	}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if !strings.Contains(string(data), actuator.ProviderName) {
+			continue
+		}
+		if !strings.Contains(string(data), "netroamer:mount") {
+			return []Finding{{WARN, "provider 挂载指纹",
+				fmt.Sprintf("%s 引用了 %s 但缺 netroamer:mount 指纹注释（卸载时无法按指纹清理）", filepath.Base(p), actuator.ProviderName),
+				"在挂载段首尾补 `# netroamer:mount-begin` / `# netroamer:mount-end` 注释（模板见仓库 clash/ 目录）"}}
+		}
+		return []Finding{{OK, "provider 挂载",
+			actuator.ProviderName + " 挂载段已存在（指纹校验通过）", ""}}
+	}
+	return []Finding{{WARN, "provider 挂载",
+		"主配置未挂载 " + actuator.ProviderName + "（直连动作即使热载成功也不生效）",
+		"把仓库 clash/rules-merge.yaml 的 provider 声明与 rules-prepend.yaml 的 RULE-SET 行（netroamer:mount 指纹段）粘入 Clash Verge 对应 Merge / 规则 prepend 配置，路径中的 REPLACE_ME 改为本机状态目录"}}
 }
 
 func checkDBPerms(dbPath string) []Finding {

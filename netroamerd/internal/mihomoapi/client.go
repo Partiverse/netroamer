@@ -123,3 +123,58 @@ func (c *Client) Connections(ctx context.Context) ([]Connection, error) {
 	}
 	return out.Connections, nil
 }
+
+// PutProvider 触发 rule-provider 热载（PUT /providers/rules/{name}）。
+// 仅作用于 netroamer 自有 provider——绝不触碰用户订阅/主配置（§2 红线）。
+func (c *Client) PutProvider(ctx context.Context, name string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/providers/rules/"+url.PathEscape(name), nil)
+	if err != nil {
+		return err
+	}
+	if c.secret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.secret)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("热载 %s 失败: %w", name, err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return ErrUnauthorized
+	case resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK:
+		return fmt.Errorf("热载 %s: HTTP %d", name, resp.StatusCode)
+	}
+	return nil
+}
+
+// ProviderInfo 是 /providers/rules/{name} 的最小解析（回读验证用）。
+type ProviderInfo struct {
+	Name      string `json:"name"`
+	Behavior  string `json:"behavior"`
+	RuleCount int    `json:"ruleCount"`
+}
+
+// ProviderInfo 回读 provider 状态；404 表示未挂载（HTTP 404 走 get 的非 200 分支）。
+func (c *Client) ProviderInfo(ctx context.Context, name string) (ProviderInfo, error) {
+	var out ProviderInfo
+	if err := c.get(ctx, "/providers/rules/"+url.PathEscape(name), &out); err != nil {
+		return ProviderInfo{}, err
+	}
+	return out, nil
+}
+
+// RuleSetMounted 检查 /rules 中是否存在指向 name 的 RULE-SET 行
+// （挂载验证的后半段：provider 加载成功 ≠ 主配置挂载了它）。
+func (c *Client) RuleSetMounted(ctx context.Context, name string) (bool, error) {
+	rules, err := c.Rules(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rules {
+		if r.Type == "RuleSet" && r.Payload == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}

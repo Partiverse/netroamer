@@ -1,6 +1,10 @@
 # netroamer Clash 规则增强 —— 订阅右键「编辑规则」，粘贴为 prepend 块
 # 三层直连保护的第 2 层；顺序即优先级，PROCESS-NAME 最先
 prepend:
+  # netroamer:mount-begin —— netroamerd 直连 provider 挂载行
+  # （须在所有代理类规则之前；配套声明见 rules-merge.yaml 指纹段）
+  - RULE-SET,netroamer-autodirect,DIRECT
+  # netroamer:mount-end
   # AI 开发工具进程级直连（任何域名兜底）
   - PROCESS-NAME-REGEX,(?i)zcode,DIRECT
   # 内网/链路本地/CGNAT/fake-ip 段不可删直连（no-resolve 零 DNS 依赖；
