@@ -318,6 +318,14 @@ func (s *Store) LastRevert(ctx context.Context, target string) (int64, error) {
 	return ts, err
 }
 
+// LastBadNodeSwitch 最近一次坏节点自动切换时刻（联动静默窗输入）。
+func (s *Store) LastBadNodeSwitch(ctx context.Context) (int64, error) {
+	var ts int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT coalesce(max(ts),0) FROM judgments WHERE kind = 'bad_node' AND action LIKE 'switch%'`).Scan(&ts)
+	return ts, err
+}
+
 // RevertCount 目标累计回滚次数（终态判定：≥3 永久仅通知——P0-2 收敛）。
 func (s *Store) RevertCount(ctx context.Context, target string) (int, error) {
 	var n int

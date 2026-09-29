@@ -4,6 +4,7 @@
 package mihomoapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -177,4 +178,77 @@ func (c *Client) RuleSetMounted(ctx context.Context, name string) (bool, error) 
 		}
 	}
 	return false, nil
+}
+
+// ProxyGroup 是 GET /proxies 中一个策略组的最小解析。
+type ProxyGroup struct {
+	Name string   `json:"name"`
+	Type string   `json:"type"`
+	Now  string   `json:"now"`
+	All  []string `json:"all"`
+}
+
+// Groups 返回全部策略组（Selector/URLTest/Fallback/LoadBalance）。
+// 节点名称只在内存使用，不落库（§2 红线）。
+func (c *Client) Groups(ctx context.Context) (map[string]ProxyGroup, error) {
+	var out struct {
+		Proxies map[string]ProxyGroup `json:"proxies"`
+	}
+	if err := c.get(ctx, "/proxies", &out); err != nil {
+		return nil, err
+	}
+	groups := map[string]ProxyGroup{}
+	for name, p := range out.Proxies {
+		switch p.Type {
+		case "Selector", "URLTest", "Fallback", "LoadBalance":
+			groups[name] = p
+		}
+	}
+	return groups, nil
+}
+
+// GroupDelay 对整个策略组发起延迟测试（事件驱动：当前节点劣化时才调用）。
+// 返回 节点名→毫秒；探测失败的节点不在返回中。
+func (c *Client) GroupDelay(ctx context.Context, group, testURL string, timeout time.Duration) (map[string]int, error) {
+	q := url.Values{}
+	q.Set("timeout", strconv.Itoa(int(timeout.Milliseconds())))
+	q.Set("url", testURL)
+	var out map[string]int
+	if err := c.get(ctx, "/group/"+url.PathEscape(group)+"/delay?"+q.Encode(), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SelectProxy 切换策略组选中节点（PUT /proxies/{group}）。W5 坏节点切换唯一挂点。
+func (c *Client) SelectProxy(ctx context.Context, group, node string) error {
+	body, err := json.Marshal(map[string]string{"name": node})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/proxies/"+url.PathEscape(group), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.secret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.secret)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("切换 %s: %w", group, err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return ErrUnauthorized
+	case resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK:
+		return fmt.Errorf("切换 %s→%s: HTTP %d", group, node, resp.StatusCode)
+	}
+	return nil
+}
+
+// ConfigForTest 以完整 URL 构造 Client（单测注入 httptest server）。
+func ConfigForTest(baseURL string) config.Config {
+	return config.Config{BaseURL: baseURL}
 }

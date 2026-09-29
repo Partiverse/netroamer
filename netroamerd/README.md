@@ -3,7 +3,19 @@
 netroamer 常驻 agent：基于 mihomo external controller API 的本地无感自愈网络层。
 设计蓝图：[../research/05-netroamerd-design.md](../research/05-netroamerd-design.md)。
 
-## 当前进度：P0 W3（判定器：探测器 / 豁免双闸 / 慢域名判定）
+## 当前进度：P1 W5（坏节点切换；P0 已全部交付）
+
+- **collector / store / analyzer / judge / actuator / retest**：见下方模块清单（P0 W1–W4 交付）。
+- **health（W5）**：节点健康状态机——分层探测（当前出口 60s/次，全组仅事件驱动）、
+  判坏要求连续性（硬故障=连续 3 败、劣化=连续 2 次超 EWMA+3×MAD 历史基线）、
+  显式健康分 `score = ewma × penalty`（失败 ×2 上限 32，恢复按 5/10/15/30min
+  四阶段减半）、切换滞回（进入 ×1.2 + 10 分钟防抖）、手动选择 30 分钟尊重窗口
+  （硬故障例外覆盖）、单节点组仅通知；节点名只在内存，probes 按 组名 记档。
+- **联动静默窗**：坏节点切换后 2h 内冻结慢域名自动直连动作（一个故障根因
+  只允许一个自愈动作，P0-1）。
+- **影子模式贯穿**：`run` 缺省对直连与切换都只记录建议，`--actuate` 才执行。
+
+## 模块清单
 
 - **collector**：WS 订阅 `/connections`（每秒全量快照），连接消失即产出样本；
   断线指数退避重连（1s→60s + 抖动）；断线后自动重发现端点（Verge 重启换 socket 路径）；

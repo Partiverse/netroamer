@@ -56,6 +56,9 @@ type Deps struct {
 	ExitNode   func(ctx context.Context, host string) (string, error) // 出口节点解析（内存）
 	Now        func() time.Time
 	Params     Params
+	// LastBadNode 最近一次坏节点切换时刻（联动静默窗 P0-1：切换后 2h 内
+	// 冻结自动动作，只出影子建议）。nil = 无联动源（过渡期）。
+	LastBadNode func() (time.Time, bool)
 }
 
 // Verdict 单个域名的判定结论。Action 非空 = 建议动作（W4 执行）；
@@ -94,9 +97,17 @@ func Run(ctx context.Context, d Deps) ([]Verdict, error) {
 		byHost[r.Host] = append(byHost[r.Host], r)
 	}
 
+	// 联动静默窗（P0-1）：坏节点切换后 2h 内冻结自动动作
+	frozen := false
+	if d.LastBadNode != nil {
+		if t, ok := d.LastBadNode(); ok && now.Sub(t) < 2*time.Hour {
+			frozen = true
+		}
+	}
+
 	var out []Verdict
 	for _, h := range hosts {
-		v := judgeHost(ctx, d, now, h, byHost[h])
+		v := judgeHost(ctx, d, now, h, byHost[h], frozen)
 		if v != nil {
 			out = append(out, *v)
 		}
@@ -105,7 +116,7 @@ func Run(ctx context.Context, d Deps) ([]Verdict, error) {
 }
 
 // judgeHost 返回 nil 表示该域名未进入候选（不产生 Verdict，避免噪音）。
-func judgeHost(ctx context.Context, d Deps, now time.Time, host string, rows []store.AggRow) *Verdict {
+func judgeHost(ctx context.Context, d Deps, now time.Time, host string, rows []store.AggRow, frozen bool) *Verdict {
 	p := d.Params
 
 	// 条件 1：域名级初筛
@@ -147,6 +158,11 @@ func judgeHost(ctx context.Context, d Deps, now time.Time, host string, rows []s
 	ev := func(reason string) *Verdict {
 		return &Verdict{Host: host, Skipped: reason,
 			Evidence: fmt.Sprintf("n=%d ewma=%.0fms p95=%.0fms 慢桶=%d", totalN, weightedEwma, maxP95, activeSlow)}
+	}
+
+	// 联动静默窗（P0-1）：节点切换后 2h 内只出建议不动作
+	if frozen {
+		return ev("联动静默窗（坏节点切换后 2h 内冻结直连动作）")
 	}
 
 	// 条件 4a：资格闸（正向白名单）
