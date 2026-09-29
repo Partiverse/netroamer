@@ -2,6 +2,7 @@
 
 > 日期：2026-09-28。依据：[00-executive-summary.md](00-executive-summary.md) 综合建议的近期三步、[02-ai-optimization.md](02-ai-optimization.md) §3/§5 技术配方、[04-security-encryption.md](04-security-encryption.md) §5 加固 checklist。
 > 本文是 P0/P1 的实施蓝图：架构、数据模型、判定算法、周粒度排期与验收标准。
+> **修订 2026-09-29**：按 [reviews/2026-09-29-05-adversarial.md](reviews/2026-09-29-05-adversarial.md) 修订 §3/§4/§5——修复 4 个 P0（桶稀释 / 回滚不可测 / 无冷却 / 豁免自举）与 P1-5/6/7/8。
 
 ---
 
@@ -101,42 +102,62 @@ CREATE TABLE agg (
   updated_at INTEGER, PRIMARY KEY (bucket, host_sld, via)
 );
 
--- 自动判定与动作日志（保留 14 天，回滚依据）
+-- 自动判定与动作日志（保留 14 天，回滚依据；P2-10 补索引与参数指纹）
 CREATE TABLE judgments (
   ts INTEGER, kind TEXT,          -- 'slow_direct' | 'bad_node' | 'rollback'
   target TEXT,                    -- 域名 或 组名×节点索引
   action TEXT,                    -- 'DIRECT on' | 'switch to #k' | 'revert'
   reason TEXT,                    -- 人类可读判定依据（含关键数字）
-  reverted INTEGER DEFAULT 0
+  reverted INTEGER DEFAULT 0,
+  params_hash TEXT DEFAULT ''     -- 判定参数指纹：算法迭代后历史判定可归因
 );
+CREATE INDEX idx_judgments_target ON judgments(target, ts);
 ```
 
 为什么不用 mihomo `/storage` 代替 SQLite：≤1MB 上限装不下 14 天样本；但 agent 仍用 `/storage` 存「上次动作摘要」供 mihomo 侧面板类工具读取。
 
 ---
 
-## 4. P1 判定算法（统计方法，参数有先例）
+## 4. P1 判定算法（统计方法，参数有先例；2026-09-29 按对抗评审修订）
 
 ### 4.1 慢域名自动直连（独占卖点，无开源先例）
 
-**触发条件（全部满足才动作，宁缺勿滥）**：
-1. 样本量：该（域名 × 时段桶）代理路径样本 ≥ 30 条；
-2. 慢：代理路径 EWMA 延迟 > 800ms **或** P95 > 1500ms（可配置），且持续 ≥ 3 个独立时段桶（避免单次网络抖动）；
-3. **直连可达且更快**：agent 从直连路径主动探测该域名（`GET /proxies/DIRECT/delay` 或本地 TCP 握手），直连成功且 EWMA 估计 < 代理路径的 50%；
-4. **不在豁免名单**：域名命中 greatfire/代理分流规则集（订阅自带 provider）→ 永不自动直连——这是「误判直连墙内域名」风险（02 报告 §5 Phase 1 已识别）的硬闸；`.cn` 主域与已知境内域名白名单优先走快路径。
+**触发条件（两层判定，全部满足才动作，宁缺勿滥）**：
 
-**动作**：把域名写入自有 rule-provider（`behavior: domain` 的 `netroamer-autodirect.yaml`）→ `PUT /providers/rules/{name}` 热载 → 记录 evidence（切换前 7 天 P50/P95 vs 切换后 24h 复测）。
+1. **域名级初筛**：该主域跨桶聚合的代理路径样本 ≥ 50 条，且加权 EWMA > 800ms **或** 最大 P95 > 1500ms（可配置）；
+2. **桶级验证**：最近聚合窗口内 ≥ 3 个活跃桶（桶内样本 ≥ 5 即「活跃」，不要求凑满大样本）EWMA 同向超阈——只要求方向一致，不做 168 桶全采样（修复 P0-1 桶稀释：原「单桶 ≥30 样本 × 持续 3 桶」组合在真实强度下触发周期以周计）；
+3. **同口径直连更快**：判定时对同一测试 URL（`https://<domain>/generate_204`）分别经 DIRECT 与当前出口节点实时探测（两侧同为 TTFB，修复 P1-5 口径失真），直连成功且延迟 < 代理路径的 50%；出口节点名取自当前连接 chains（仅内存使用，不落库——隐私边界 §2 不变）；
+4. **本地化豁免双闸**（修复 P0-4 自举依赖）：
+   - **资格闸（正向白名单）**：候选域名必须 `.cn` TLD、内置境内域名列表、或用户显式 allow 文件（`~/.config/netroamer/netroamer-allow.txt`，每行一域）三者之一——没有资格就没有候选资格；
+   - **豁免闸（负向硬闸）**：域名命中 mihomo `GET /rules` 中任何「DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD → 非 DIRECT」规则、或用户 exempt 文件（`netroamer-exempt.txt`）→ 永不自动直连。判定全本地、零外部依赖；greatfire 列表仅作离线参考数据随包分发，不再运行时拉取。
+   - 已知局限（W3 记录在案）：GEOSITE/GEOIP/rule-provider 类规则无法本地展开，靠条件 3 的直连探测失败兜底（被墙域名直连探测大概率不通）+ 条件 5 的配额/回滚止损。
 
-**回滚**：切换后 24h 内直连成功率 < 95% 或延迟劣化 → 自动回滚（从 provider 移除 + 重新热载），judgments 表标记；`netroamerd rollback` 支持手动一键撤销最近 N 条；同一域名 7 天内最多自动切换 2 次，超过则降级为「通知 + 建议」不再自动动作（防震荡）。
+**动作**：把域名写入自有 rule-provider（`behavior: domain` 的 `netroamer-autodirect.yaml`）→ `PUT /providers/rules/{name}` 热载 → **`GET /rules` 回读验证域名可见**（修复 P1-8：不可见则指数退避重试，3 次失败回滚文件并告警，杜绝「文件已写、内核未载」的状态漂移）→ 记录 evidence（切换前窗口 P50/P95 vs 切换后 24h 复测序列）。
+
+**复测与回滚**（修复 P0-2：`/connections` 不含失败连接，被动观测测不出成功率）：
+- 切换后 24h 内**每小时经 DIRECT 主动探测**该域名（同口径），形成复测序列——复测器是回滚状态机的唯一事实来源，被动样本只做佐证；
+- 回滚条件：复测成功率 < 95%，或复测 EWMA 相对直连探测基线劣化 > 30%；
+- 回滚 = provider 移除 + 热载 + 回读验证 + judgments 记录 `revert`；`netroamerd rollback` 支持手动一键撤销最近 N 条。
+
+**配额与冷却**（修复 P0-3 震荡路径）：
+- **计数语义**：只有实际写 provider 的动作计数——同域名 7 天内最多 2 次；回滚**不计数**，但回滚立即设置同域名 **7 天冷却**（冷却期内即使配额剩余也不动作）；
+- **降级态退出条件**：冷却期满，且此后 3 个活跃桶不再满足条件 2（否则继续通知 + 建议，不自动动作）。
 
 ### 4.2 坏节点自动切换
 
-参数对标 Clash Party Smart Core 公开逻辑（02 报告 §3.2，先例可信）：
+参数对标 Clash Party Smart Core 公开逻辑（02 报告 §3.2，先例可信），修订两处（P1-6/P1-7）：
 
-- **判坏**：节点握手超时 > 该节点历史 EWMA × 1.5，或连续 3 次探测失败，或 5 分钟窗口 fail_rate > 30%；
+- **判坏**：节点握手超时 > 该节点历史 EWMA + 3×MAD，**阈值钳位 [200ms, 1000ms]**（替代裸 1.5× 比例——低延迟节点阈值过紧、高延迟节点形同虚设）；或连续 3 次探测失败；或 5 分钟窗口 fail_rate > 30%；
 - **指数惩罚**：每次失败罚分 ×2 递增，恢复成功按 5/10/15/30 分钟分阶段降级（避免抖动振荡）；
-- **切换**：当前节点健康分低于组内最优节点且差距 > 20% → `PUT /proxies/{group}`；同组 10 分钟内最多切换 1 次；「手动选择」的组（用户最近 30 分钟手动切过）一律不动——尊重用户意志是「无感」的边界；
+- **切换**：当前节点健康分低于组内最优节点且差距 > 20% → `PUT /proxies/{group}`；同组 10 分钟内最多切换 1 次；
+- **手动选择尊重窗口**：用户最近 30 分钟手动切过的组不动——**例外**：硬故障（连续 3 次探测失败且组内其他节点健康）时通知并覆盖，通知注明「因节点完全不可达临时越过手动选择」（不让用户为尊重窗口扛 30 分钟死节点）；
 - **通知**：切换即生成 evidence 并发系统通知（复用 net-watchdog.sh 的 notify 通道），附修复前后对照。
+
+### 4.3 判定基础设施（修订新增）
+
+- judgments 表补 `(target, ts)` 索引与 `params_hash` 列（P2-10）：算法迭代后历史判定可归因到当时参数；
+- 判定器输入统一走 agg + 实时探测，不在判定路径读原始样本；
+- unix socket 路径失效（Clash Verge 重启后临时目录哈希变化）→ collector 重连前重新发现端点（P1-9），避免对死 socket 永久退避。
 
 ---
 
@@ -153,8 +174,8 @@ CREATE TABLE judgments (
 
 | 周 | 任务 | 验收 |
 |---|---|---|
-| W3 | 直连可达性预验证探测器；豁免名单机制（greatfire 命中即拒）；慢域名判定器 | 判定器在回放数据集上零「墙内域名误直连」 |
-| W4 | 自有 rule-provider 生成 + `PUT /providers/rules` 热载；24h 复测回滚状态机；`netroamerd rollback` | 热载后 `GET /rules` 可见且顺序正确；人工制造慢域名场景端到端走通 |
+| W3 | mihomo REST 客户端（version/rules/delay/connections）；同口径直连/代理探测器；豁免双闸（资格白名单 + 本地规则豁免 + 用户 allow/exempt 文件）；慢域名判定器（两层统计 + 配额/冷却状态机）；judgments 索引与 params_hash 迁移；collector 端点重发现 | 判定器回放数据集上豁免域名零动作；配额与冷却语义单测全覆盖 |
+| W4 | 自有 rule-provider 生成 + `PUT /providers/rules` 热载（强制 `GET /rules` 回读验证 + 失败退避重试）；24h 主动探测复测回滚状态机；`netroamerd rollback` | 热载后 `GET /rules` 可见且顺序正确；人工制造慢域名场景端到端走通；复测失败自动回滚且 evidence 完整 |
 | W5 | 节点健康分（1.5× 握手阈值 + 指数惩罚 + 分阶段恢复）；`PUT /proxies` 切换 + 防震荡限制；尊重手动选择 | 坏节点场景 3 分钟内自动切换且 10 分钟内不回切 |
 | W6 | evidence 生成（JSON + Markdown）；系统通知接入；`netroamerd uninstall` 全量回滚（agent + LaunchAgent + 自有 provider + judgments 留档）；bootstrap.sh 集成安装；README/文档 | 卸载后 mihomo 配置与安装前等价（diff 为空） |
 
