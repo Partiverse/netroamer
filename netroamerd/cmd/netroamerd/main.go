@@ -1,0 +1,482 @@
+// netroamerd —— netroamer 常驻 agent（research/05 设计蓝图）。
+// P0：W1 遥测采集（WS /connections → SQLite）+ W2 聚合/自检/常驻安装。
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"text/tabwriter"
+	"time"
+
+	"github.com/Partiverse/netroamer/netroamerd/internal/actuator"
+	"github.com/Partiverse/netroamer/netroamerd/internal/analyzer"
+	"github.com/Partiverse/netroamer/netroamerd/internal/collector"
+	"github.com/Partiverse/netroamer/netroamerd/internal/config"
+	"github.com/Partiverse/netroamer/netroamerd/internal/doctor"
+	"github.com/Partiverse/netroamer/netroamerd/internal/exempt"
+	"github.com/Partiverse/netroamer/netroamerd/internal/health"
+	"github.com/Partiverse/netroamer/netroamerd/internal/judge"
+	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
+	"github.com/Partiverse/netroamer/netroamerd/internal/retest"
+	"github.com/Partiverse/netroamer/netroamerd/internal/service"
+	"github.com/Partiverse/netroamer/netroamerd/internal/store"
+)
+
+const version = "0.5.0-w5"
+
+func main() {
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "run":
+		run(os.Args[2:], log)
+	case "status":
+		statusCmd(log)
+	case "judge":
+		judgeCmd(log)
+	case "rollback":
+		rollbackCmd(os.Args[2:], log)
+	case "doctor":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		os.Exit(doctor.Run(ctx, os.Stdout))
+	case "install":
+		if err := service.Install(mustExe()); err != nil {
+			log.Error("安装失败", "err", err)
+			os.Exit(1)
+		}
+		stateDir, _ := service.StateDir()
+		fmt.Printf("已安装并启动 %s（用户级，开机自启 + 崩溃拉起）\n日志: %s\n验证: netroamerd status / netroamerd doctor\n",
+			service.Label, filepath.Join(stateDir, "netroamerd.log"))
+	case "uninstall":
+		if err := service.Uninstall(); err != nil && !os.IsNotExist(err) {
+			log.Error("卸载失败", "err", err)
+			os.Exit(1)
+		}
+		fmt.Printf("已停止并移除 %s（遥测数据与 ~/.local/bin/netroamerd 保留）\n", service.Label)
+	case "version", "--version", "-v":
+		fmt.Println("netroamerd", version)
+	case "help", "--help", "-h":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "未知子命令 %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func mustExe() string {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "无法定位自身二进制:", err)
+		os.Exit(1)
+	}
+	return exe
+}
+
+func usage() {
+	fmt.Print(`netroamerd —— 本地无感自愈网络层常驻 agent（P0 W4）
+
+用法:
+  netroamerd run [flags]     常驻采集 → 聚合 → 判定（缺省影子模式，--actuate 实际动作）
+  netroamerd status          延迟矩阵摘要（库/样本/聚合/服务状态）
+  netroamerd judge           慢域名判定器单轮试运行（只读，不写规则/不动作）
+  netroamerd rollback [--last N]  撤销最近 N 条直连动作（默认 1）
+  netroamerd doctor          环境自检：secret、API 可达、暴露面、NO_PROXY、权限、挂载、常驻
+  netroamerd install         安装并启动用户级常驻（macOS LaunchAgent / Linux systemd --user）
+  netroamerd uninstall       停止并移除常驻（数据与二进制保留）
+  netroamerd version
+
+run flags:
+  --once <dur>   调试：运行指定时长后退出（如 30s），缺省常驻
+  --url <u>      覆盖 mihomo API 地址（默认自动发现，须环回）
+  --db <path>    覆盖 SQLite 路径（默认 ~/.local/state/netroamer/telemetry.db）
+  --actuate      实际执行判定动作（写 provider + 热载 + 复测回滚）；缺省影子模式只记录
+
+secret 发现顺序: $NETROAMER_MIHOMO_SECRET → ~/.config/netroamer/mihomo.secret
+  → mihomo/Clash Verge 配置 secret:（内容不回显、不写日志）
+`)
+}
+
+func run(args []string, log *slog.Logger) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	once := fs.Duration("once", 0, "调试运行时长，0=常驻")
+	urlFlag := fs.String("url", "", "覆盖 mihomo API base URL")
+	dbFlag := fs.String("db", "", "覆盖 SQLite 路径")
+	actuate := fs.Bool("actuate", false, "实际执行判定动作（缺省影子模式）")
+	_ = fs.Parse(args)
+
+	cfg, err := config.Load()
+	if err != nil {
+		log.Error("配置加载失败", "err", err)
+		os.Exit(1)
+	}
+	if *urlFlag != "" {
+		if err := cfg.SetBaseURL(*urlFlag); err != nil {
+			log.Error("URL 无效", "err", err)
+			os.Exit(1)
+		}
+		// 显式指定 TCP 端点时清掉自动发现的 unix socket：127.0.0.1 不是
+		// socket 文件，沿用会 dial 失败（且 127.0.0.1:9097 是 Verge 下
+		// 常见的未监听残留端口）
+		cfg.UnixSocket = ""
+	}
+	if *dbFlag != "" {
+		cfg.DBPath = *dbFlag
+	}
+	if cfg.LoopbackRewritten {
+		log.Warn("external-controller 非环回地址，已强制改写为 127.0.0.1（安全红线，research/05 §2）")
+	}
+	if cfg.Secret == "" {
+		log.Warn("未发现 mihomo secret；若 API 已设 secret 将持续 401。修复：运行 `netroamerd doctor` 获取指令")
+	}
+	log.Info("netroamerd 启动", "version", version, "config", cfg.String())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *once > 0 {
+		log.Info("调试模式：限时运行", "duration", *once)
+		time.AfterFunc(*once, stop)
+	}
+
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		log.Error("SQLite 打开失败", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	collectorErr := make(chan error, 1)
+	opts := collector.Options{URL: cfg.BaseURL, UnixSocket: cfg.UnixSocket, Secret: cfg.Secret}
+	opts.Rediscover = func() (string, string, string) {
+		nc, err := config.Load()
+		if err != nil {
+			return "", "", ""
+		}
+		// 显式覆盖了端点时不重发现（否则会被自动发现结果覆盖回无效组合）
+		if *urlFlag != "" {
+			return "", "", ""
+		}
+		return nc.BaseURL, nc.UnixSocket, nc.Secret
+	}
+	go func() {
+		collectorErr <- collector.Run(ctx, opts, log, st.InsertSamples)
+	}()
+
+	// 判定/动作/复测（05 §4.1；W4）+ 节点健康（§4.2；W5）：缺省影子模式
+	api := mihomoapi.New(cfg)
+	hm := health.New(api, st, log, *actuate)
+	act := actuator.New(api, cfg.ProviderPath)
+	rt := retest.New(st, act, api, log)
+	paramsHash := judge.Default().Hash()
+	runJudge := func() {
+		ctxJ, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		rules, err := api.Rules(ctxJ)
+		if err != nil {
+			log.Warn("judge 跳过本轮：读取 /rules 失败", "err", err)
+			return
+		}
+		home, _ := os.UserHomeDir()
+		ncDir := filepath.Join(home, ".config", "netroamer")
+		verdicts, err := judge.Run(ctxJ, judge.Deps{
+			Store:      st,
+			API:        api,
+			Matcher:    exempt.BuildMatcher(rules),
+			AllowList:  exempt.UserList(filepath.Join(ncDir, "netroamer-allow.txt")),
+			ExemptList: exempt.UserList(filepath.Join(ncDir, "netroamer-exempt.txt")),
+			ExitNode:   exitNodeResolver(api),
+			Params:     judge.Default(),
+			LastBadNode: func() (time.Time, bool) {
+				t, ok, err := hm.LastBadNodeSwitch(ctxJ)
+				if err != nil || !ok {
+					return time.Time{}, false
+				}
+				return t, true
+			},
+		})
+		if err != nil {
+			log.Warn("judge 失败", "err", err)
+			return
+		}
+		for _, v := range verdicts {
+			if v.Action == "" {
+				log.Info("judge", "host", v.Host, "skip", v.Skipped)
+				continue
+			}
+			if !*actuate {
+				log.Info("judge 影子建议（--actuate 后执行）", "host", v.Host, "evidence", v.Evidence)
+				continue
+			}
+			if err := act.Enable(ctxJ, v.Host); err != nil {
+				log.Error("直连动作失败（文件已还原，不消耗配额）", "host", v.Host, "err", err)
+				continue
+			}
+			_ = st.InsertJudgment(ctxJ, store.Judgment{TS: time.Now().Unix(),
+				Kind: "slow_direct", Target: v.Host, Action: "DIRECT on",
+				Reason: v.Evidence, ParamsHash: paramsHash})
+			log.Info("已执行直连动作", "host", v.Host, "evidence", v.Evidence)
+		}
+	}
+
+	updateAgg := func() {
+		n, err := analyzer.Update(ctx, st, time.Now())
+		if err != nil {
+			log.Warn("聚合失败", "err", err)
+		} else {
+			log.Info("聚合完成", "groups", n)
+		}
+	}
+	updateAgg() // 启动先聚合一次（空库无妨）
+
+	prune := time.NewTicker(time.Hour) // samples 保留 7 天（research/05 §3）
+	defer prune.Stop()
+	agg := time.NewTicker(5 * time.Minute) // 滚动聚合（research/05 §3）
+	defer agg.Stop()
+	judgeTick := time.NewTicker(5 * time.Minute) // 判定 + 复测状态机
+	defer judgeTick.Stop()
+	healthTick := time.NewTicker(time.Minute) // 节点健康探测（§4.2：出口 60s/次）
+	defer healthTick.Stop()
+	beat := time.NewTicker(10 * time.Minute) // 心跳：72h 挂机验收的存活观测点
+	defer beat.Stop()
+
+	runJudge() // 启动先跑一轮（影子/动作取决于 --actuate）
+
+	for {
+		select {
+		case err := <-collectorErr:
+			n, _ := st.Count(context.Background())
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				log.Error("collector 异常退出", "err", err)
+				os.Exit(1)
+			}
+			log.Info("collector 已停止", "samples_total", n)
+			return
+		case <-agg.C:
+			updateAgg()
+		case <-judgeTick.C:
+			runJudge()
+			if err := rt.Tick(ctx); err != nil {
+				log.Warn("复测状态机异常", "err", err)
+			}
+		case <-healthTick.C:
+			hm.Tick(ctx)
+		case <-prune.C:
+			if n, err := st.Prune(ctx, time.Now(), 7*24*time.Hour); err != nil {
+				log.Warn("样本清理失败", "err", err)
+			} else if n > 0 {
+				log.Info("清理过期样本", "deleted", n)
+			}
+		case <-beat.C:
+			if n, err := st.Count(ctx); err == nil {
+				log.Info("心跳", "samples_total", n)
+			}
+		case <-ctx.Done():
+			log.Info("退出中", "reason", "signal")
+			select {
+			case <-collectorErr:
+			case <-time.After(3 * time.Second):
+				log.Warn("collector 收尾超时，强制退出")
+			}
+			return
+		}
+	}
+}
+
+// exitNodeResolver 从当前活跃连接解析域名的出口节点（仅内存使用不落库，
+// research/05 §2 红线：不存节点名称）。
+func exitNodeResolver(api *mihomoapi.Client) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, host string) (string, error) {
+		conns, err := api.Connections(ctx)
+		if err != nil {
+			return "", err
+		}
+		for _, c := range conns {
+			if strings.HasSuffix(strings.ToLower(c.Metadata.Host), host) &&
+				len(c.Chains) > 0 && c.Chains[0] != "DIRECT" {
+				return c.Chains[0], nil
+			}
+		}
+		return "", fmt.Errorf("无 %s 的活跃代理连接", host)
+	}
+}
+
+// rollbackCmd 手动撤销最近 N 条直连动作（provider 移除 + 热载验证 + judgments 留档）。
+func rollbackCmd(args []string, log *slog.Logger) {
+	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
+	last := fs.Int("last", 1, "撤销最近 N 条未回滚动作")
+	_ = fs.Parse(args)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Error("配置加载失败", "err", err)
+		os.Exit(1)
+	}
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		log.Error("SQLite 打开失败", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	api := mihomoapi.New(cfg)
+	act := actuator.New(api, cfg.ProviderPath)
+	actions, err := st.ActiveActions(ctx, time.Now(), 30*24*time.Hour)
+	if err != nil {
+		log.Error("读取动作失败", "err", err)
+		os.Exit(1)
+	}
+	var targets []string
+	seen := map[string]bool{}
+	for i := len(actions) - 1; i >= 0 && len(targets) < *last; i-- {
+		if t := actions[i].Target; !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		fmt.Println("没有可撤销的直连动作")
+		return
+	}
+	for _, t := range targets {
+		if err := act.Disable(ctx, t); err != nil {
+			log.Error("回滚失败", "target", t, "err", err)
+			continue
+		}
+		_ = st.InsertJudgment(ctx, store.Judgment{TS: time.Now().Unix(),
+			Kind: "slow_direct", Target: t, Action: "revert",
+			Reason: "手动 rollback", Reverted: true, ParamsHash: judge.Default().Hash()})
+		fmt.Println("已回滚:", t)
+	}
+}
+
+// judgeCmd 判定器单轮试运行（只读）：对当前 agg 数据跑一轮慢域名判定，
+// 打印候选与跳过原因；不写 provider、不写 judgments（动作在 W4 actuator）。
+func judgeCmd(log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Error("配置加载失败", "err", err)
+		os.Exit(1)
+	}
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		log.Error("SQLite 打开失败", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	api := mihomoapi.New(cfg)
+	rules, err := api.Rules(ctx)
+	if err != nil {
+		log.Error("读取 /rules 失败（豁免闸不可用，拒绝判定）", "err", err)
+		os.Exit(1)
+	}
+	home, _ := os.UserHomeDir()
+	ncDir := filepath.Join(home, ".config", "netroamer")
+	verdicts, err := judge.Run(ctx, judge.Deps{
+		Store:      st,
+		API:        api,
+		Matcher:    exempt.BuildMatcher(rules),
+		AllowList:  exempt.UserList(filepath.Join(ncDir, "netroamer-allow.txt")),
+		ExemptList: exempt.UserList(filepath.Join(ncDir, "netroamer-exempt.txt")),
+		ExitNode:   exitNodeResolver(api),
+		Now:        time.Now,
+		Params:     judge.Default(),
+	})
+	if err != nil {
+		log.Error("判定失败", "err", err)
+		os.Exit(1)
+	}
+	fmt.Printf("netroamerd judge（试运行，规则 %d 条；W3 只读不动作）\n", len(rules))
+	if len(verdicts) == 0 {
+		fmt.Println("当前无候选域名（两层统计未筛出慢域名）")
+		return
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  主域\t结论")
+	for _, v := range verdicts {
+		conclusion := v.Action
+		if conclusion == "" {
+			conclusion = "跳过" + v.Skipped
+		}
+		fmt.Fprintf(tw, "  %s\t%s\n", v.Host, conclusion)
+		if v.Action != "" {
+			fmt.Fprintf(tw, "    证据: %s\n", v.Evidence)
+		}
+	}
+	tw.Flush()
+}
+
+func statusCmd(log *slog.Logger) {
+	fmt.Println("netroamerd", version)
+	if st, err := service.Status(); err == nil {
+		fmt.Println("服务:", st, "["+service.Label+"]")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Println("配置加载失败:", err)
+		os.Exit(1)
+	}
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		fmt.Println("SQLite 打开失败（先运行 netroamerd run / install）:", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	total, first, last, err := st.Stats(ctx)
+	if err != nil {
+		fmt.Println("读取样本失败:", err)
+		os.Exit(1)
+	}
+	if sz, err := os.Stat(cfg.DBPath); err == nil {
+		fmt.Printf("库: %s (%.1fMB)\n", cfg.DBPath, float64(sz.Size())/(1<<20))
+	}
+	if total == 0 {
+		fmt.Println("样本: 0 条（采集器未运行？检查 `netroamerd status` 服务行与 `netroamerd doctor`）")
+		return
+	}
+	fmt.Printf("样本: %d 条, %s → %s\n", total,
+		time.Unix(first, 0).Format("01-02 15:04"), time.Unix(last, 0).Format("01-02 15:04"))
+
+	if lastRun, err := st.LastAggRun(ctx); err == nil && lastRun > 0 {
+		fmt.Println("聚合: 最近更新", time.Unix(lastRun, 0).Format("01-02 15:04"))
+	} else {
+		fmt.Println("聚合: 尚未运行（常驻模式下每 5 分钟滚动）")
+	}
+
+	rows, err := st.RecentAgg(ctx, 15)
+	if err != nil || len(rows) == 0 {
+		fmt.Println("TOP 域名: 暂无聚合数据")
+		return
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  主域\t路径\tEWMA\tP95\t失败率\t样本")
+	for _, r := range rows {
+		ewma, p95 := "-", "-"
+		if r.EwmaMs > 0 {
+			ewma = fmt.Sprintf("%.0fms", r.EwmaMs)
+		}
+		if r.P95Ms > 0 {
+			p95 = fmt.Sprintf("%.0fms", r.P95Ms)
+		}
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%.1f%%\t%d\n",
+			r.Host, r.Via, ewma, p95, r.FailRate*100, r.N)
+	}
+	tw.Flush()
+}

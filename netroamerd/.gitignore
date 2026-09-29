@@ -1,4 +1,5 @@
-netroamerd
+# 编译产物（二进制名为 netroamerd，与目录同名）
+/netroamerd
 *.db
 *.db-wal
 *.db-shm
