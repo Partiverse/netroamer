@@ -20,7 +20,8 @@ type Config struct {
 	UnixSocket        string // 非空时走 unix domain socket（Clash Verge Rev 默认形态）
 	Secret            string
 	DBPath            string
-	LoopbackRewritten bool // 发现的 external-controller 非环回，已被强制改写
+	ProviderPath      string // 自有 rule-provider 文件（必须在 mihomo -d 目录内，SAFE_PATHS）
+	LoopbackRewritten bool   // 发现的 external-controller 非环回，已被强制改写
 }
 
 // String 脱敏表示，可直接进日志。
@@ -77,6 +78,11 @@ func Load() (Config, error) {
 			break
 		}
 	}
+
+	// Provider 文件位置：mihomo 内核（Verge Rev 编译版）要求 provider path
+	// 必须在 -d 目录或编译期 SAFE_PATHS 内（实测事故：state 目录被拒，
+	// 整份配置校验失败、内核不应用）。相对路径天然落在 -d 下，最稳。
+	cfg.ProviderPath = providerPath(home)
 
 	// 传输选择：Clash Verge Rev 默认只开 unix socket（config.yaml 里的
 	// TCP external-controller 常是残留配置、运行时并未监听），
@@ -165,6 +171,30 @@ func readTrim(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// providerPath 确定自有 rule-provider 文件路径：优先 Verge 应用目录
+// （= Verge 内核 -d），次 mihomo 配置目录（纯 mihomo 的 -d），
+// fallback state 目录（doctor 会告警 SAFE_PATHS 风险）。
+func providerPath(home string) string {
+	candidates := []string{}
+	if runtime.GOOS == "darwin" {
+		candidates = append(candidates, filepath.Join(home, "Library", "Application Support",
+			"io.github.clash-verge-rev.clash-verge-rev"))
+	}
+	if ad := os.Getenv("APPDATA"); ad != "" && runtime.GOOS == "windows" {
+		candidates = append(candidates, filepath.Join(ad,
+			"io.github.clash-verge-rev.clash-verge-rev"))
+	}
+	for _, dir := range candidates {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return filepath.Join(dir, "netroamer", "autodirect.yaml")
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(home, ".config", "mihomo")); err == nil && fi.IsDir() {
+		return filepath.Join(home, ".config", "mihomo", "netroamer", "autodirect.yaml")
+	}
+	return filepath.Join(home, ".local", "state", "netroamer", "autodirect.yaml")
 }
 
 func expandHome(path, home string) string {

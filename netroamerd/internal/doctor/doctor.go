@@ -171,6 +171,7 @@ func checkNoProxy(home string) []Finding {
 func checkProviderMount(ctx context.Context, home string, cfg config.Config) []Finding {
 	// 文本层：扫主配置/profiles/运行时合成文件
 	declared, mounted, badTopLevel := false, false, ""
+	badPath := ""
 	paths := config.MihomoConfigPaths(home)
 	vergeProfiles := filepath.Join(home, "Library", "Application Support",
 		"io.github.clash-verge-rev.clash-verge-rev", "profiles")
@@ -194,6 +195,23 @@ func checkProviderMount(ctx context.Context, home string, cfg config.Config) []F
 		if strings.Contains(text, "RULE-SET,"+actuator.ProviderName) {
 			mounted = true
 		}
+		// provider path 形态：相对路径必然落在内核 -d 目录（SAFE_PATHS 内）；
+		// 绝对路径指到 -d 外会被整份配置拒绝（实测事故）。
+		for _, line := range strings.Split(text, "\n") {
+			t := strings.TrimSpace(line)
+			if !strings.HasPrefix(t, "path:") {
+				continue
+			}
+			v := strings.TrimSpace(strings.TrimPrefix(t, "path:"))
+			v = strings.Trim(v, "\"'")
+			if strings.HasPrefix(v, "/") && !strings.Contains(text, "rule-providers:") {
+				continue // 非 provider 段的 path（如 external-controller-unix）不管
+			}
+			if strings.HasPrefix(v, "/") && !strings.HasPrefix(v, home+"/Library/Application Support/io.github.clash-verge-rev") &&
+				!strings.HasPrefix(v, home+"/.config/mihomo") {
+				badPath = v
+			}
+		}
 		for _, line := range strings.Split(text, "\n") {
 			if strings.HasPrefix(line, actuator.ProviderName+":") {
 				badTopLevel = filepath.Base(p)
@@ -204,6 +222,11 @@ func checkProviderMount(ctx context.Context, home string, cfg config.Config) []F
 		return []Finding{{WARN, "provider 挂载",
 			"主配置未声明 " + actuator.ProviderName + "（直连动作即使热载成功也不生效）",
 			"把仓库 clash/rules-merge.yaml 的 netroamer:mount 指纹段粘入 Clash Verge 的 Merge 配置（嵌套在 rule-providers 下，并带 prepend-rules 挂载行），路径 REPLACE_ME 改为本机状态目录，然后在 Verge 中重新激活该订阅"}}
+	}
+	if badPath != "" {
+		return []Finding{{FAIL, "provider path 越界",
+			fmt.Sprintf("provider path %s 在内核 -d 目录之外——Verge 编译版内核（SAFE_PATHS）会拒绝整份配置，提示「未能确认已应用到内核」", badPath),
+			"把 Merge 中 provider 的 path 改为相对路径 netroamer/autodirect.yaml（netroamerd 自动写到应用目录内），重新激活订阅"}}
 	}
 	if badTopLevel != "" {
 		return []Finding{{FAIL, "provider 挂载结构",
