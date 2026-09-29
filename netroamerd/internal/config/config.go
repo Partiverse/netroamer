@@ -125,8 +125,11 @@ func mihomoConfigPaths(home string) []string {
 	var paths []string
 	switch runtime.GOOS {
 	case "darwin":
-		paths = append(paths, filepath.Join(home, "Library", "Application Support",
-			"io.github.clash-verge-rev.clash-verge-rev", "config.yaml"))
+		base := filepath.Join(home, "Library", "Application Support",
+			"io.github.clash-verge-rev.clash-verge-rev")
+		paths = append(paths,
+			filepath.Join(base, "config.yaml"),
+			filepath.Join(base, "clash-verge.yaml")) // Verge 运行时合成配置（真实生效）
 	case "windows":
 		if ad := os.Getenv("APPDATA"); ad != "" {
 			paths = append(paths, filepath.Join(ad,

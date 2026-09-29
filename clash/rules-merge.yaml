@@ -20,11 +20,18 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/cncidr.txt
     path: ./ruleset/cncidr.yaml
   # netroamer:mount-begin —— netroamerd 自有直连 provider（W4）。
-  # path 中 REPLACE_ME 必须改为本机状态目录（如 /Users/xxx/.local/state/netroamer）；
-  # `netroamerd doctor` 会校验本段；卸载时按指纹清理。
+  # 注意：provider 声明必须嵌套在 rule-providers 之下——写成顶级键会被
+  # mihomo 静默忽略（实测事故，doctor 会以 FAIL 捕捉）。
+  # path 中 REPLACE_ME 必须改为本机状态目录；卸载时按指纹清理。
   netroamer-autodirect:
     type: file
     behavior: domain
     interval: 300
     path: /Users/REPLACE_ME/.local/state/netroamer/netroamer-autodirect.yaml
   # netroamer:mount-end
+
+# netroamer:mount-begin —— RULE-SET 挂载行（Merge 内嵌挂载，与
+# rules-prepend.yaml 的 prepend 段二选一即可；粘贴后需在 Verge 重新激活订阅）。
+prepend-rules:
+  - RULE-SET,netroamer-autodirect,DIRECT
+# netroamer:mount-end

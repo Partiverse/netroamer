@@ -2,7 +2,8 @@
 # 三层直连保护的第 2 层；顺序即优先级，PROCESS-NAME 最先
 prepend:
   # netroamer:mount-begin —— netroamerd 直连 provider 挂载行
-  # （须在所有代理类规则之前；配套声明见 rules-merge.yaml 指纹段）
+  # （须在所有代理类规则之前；配套声明见 rules-merge.yaml 指纹段。
+  #   注意：也可以只在 Merge 里用 prepend-rules 挂载，二选一）
   - RULE-SET,netroamer-autodirect,DIRECT
   # netroamer:mount-end
   # AI 开发工具进程级直连（任何域名兜底）

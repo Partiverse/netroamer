@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Partiverse/netroamer/netroamerd/internal/actuator"
 	"github.com/Partiverse/netroamer/netroamerd/internal/config"
@@ -66,7 +67,7 @@ func Run(ctx context.Context, out io.Writer) int {
 	findings = append(findings, checkExposure(home)...)
 	findings = append(findings, checkNoProxy(home)...)
 	findings = append(findings, checkDBPerms(cfg.DBPath)...)
-	findings = append(findings, checkProviderMount(home)...)
+	findings = append(findings, checkProviderMount(ctx, home, cfg)...)
 	if st, err := service.Status(); err != nil {
 		findings = append(findings, Finding{WARN, "常驻服务状态", err.Error(), ""})
 	} else if strings.Contains(st, "未安装") {
@@ -164,9 +165,12 @@ func checkNoProxy(home string) []Finding {
 		"重新运行仓库根目录的 bootstrap.sh 重建 rc 文件（需新终端生效）"}}
 }
 
-// checkProviderMount 校验自有 rule-provider 的主配置挂载（独立复评 P1-3：
-// provider 文件不产生匹配，主配置必须有声明 + RULE-SET 行，且带指纹注释）。
-func checkProviderMount(home string) []Finding {
+// checkProviderMount 校验自有 rule-provider 挂载（独立复评 P1-3）。
+// 三层：①声明嵌套在 rule-providers 下（顶级键会被 mihomo 静默忽略——实测事故）；
+// ②存在 RULE-SET 挂载行；③API 实测 provider 可读且 /rules 有 RULE-SET 行。
+func checkProviderMount(ctx context.Context, home string, cfg config.Config) []Finding {
+	// 文本层：扫主配置/profiles/运行时合成文件
+	declared, mounted, badTopLevel := false, false, ""
 	paths := config.MihomoConfigPaths(home)
 	vergeProfiles := filepath.Join(home, "Library", "Application Support",
 		"io.github.clash-verge-rev.clash-verge-rev", "profiles")
@@ -182,20 +186,55 @@ func checkProviderMount(home string) []Finding {
 		if err != nil {
 			continue
 		}
-		if !strings.Contains(string(data), actuator.ProviderName) {
+		text := string(data)
+		if !strings.Contains(text, actuator.ProviderName) {
 			continue
 		}
-		if !strings.Contains(string(data), "netroamer:mount") {
-			return []Finding{{WARN, "provider 挂载指纹",
-				fmt.Sprintf("%s 引用了 %s 但缺 netroamer:mount 指纹注释（卸载时无法按指纹清理）", filepath.Base(p), actuator.ProviderName),
-				"在挂载段首尾补 `# netroamer:mount-begin` / `# netroamer:mount-end` 注释（模板见仓库 clash/ 目录）"}}
+		declared = true
+		if strings.Contains(text, "RULE-SET,"+actuator.ProviderName) {
+			mounted = true
 		}
-		return []Finding{{OK, "provider 挂载",
-			actuator.ProviderName + " 挂载段已存在（指纹校验通过）", ""}}
+		for _, line := range strings.Split(text, "\n") {
+			if strings.HasPrefix(line, actuator.ProviderName+":") {
+				badTopLevel = filepath.Base(p)
+			}
+		}
 	}
-	return []Finding{{WARN, "provider 挂载",
-		"主配置未挂载 " + actuator.ProviderName + "（直连动作即使热载成功也不生效）",
-		"把仓库 clash/rules-merge.yaml 的 provider 声明与 rules-prepend.yaml 的 RULE-SET 行（netroamer:mount 指纹段）粘入 Clash Verge 对应 Merge / 规则 prepend 配置，路径中的 REPLACE_ME 改为本机状态目录"}}
+	if !declared {
+		return []Finding{{WARN, "provider 挂载",
+			"主配置未声明 " + actuator.ProviderName + "（直连动作即使热载成功也不生效）",
+			"把仓库 clash/rules-merge.yaml 的 netroamer:mount 指纹段粘入 Clash Verge 的 Merge 配置（嵌套在 rule-providers 下，并带 prepend-rules 挂载行），路径 REPLACE_ME 改为本机状态目录，然后在 Verge 中重新激活该订阅"}}
+	}
+	if badTopLevel != "" {
+		return []Finding{{FAIL, "provider 挂载结构",
+			fmt.Sprintf("%s 中 %s 是顶级键——mihomo 只认 rule-providers 下的声明，顶级键被静默忽略（实测事故）", badTopLevel, actuator.ProviderName),
+			"把声明缩进到 rule-providers: 之下（参考仓库 clash/rules-merge.yaml 指纹段），在 Verge 重新激活订阅"}}
+	}
+
+	// API 实测层：文本对了不代表内核已重载
+	api := mihomoapi.New(cfg)
+	apiCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	if _, err := api.ProviderInfo(apiCtx, actuator.ProviderName); err != nil {
+		return []Finding{{WARN, "provider 生效状态",
+			fmt.Sprintf("配置文件已声明但内核未加载（%v）——可能 Verge 尚未重新激活订阅", err),
+			"在 Clash Verge 中重新激活当前订阅（左键点击订阅卡片或右键激活），然后重跑 doctor"}}
+	}
+	ok, err := api.RuleSetMounted(apiCtx, actuator.ProviderName)
+	if err != nil {
+		return []Finding{{WARN, "provider 生效状态", fmt.Sprintf("读取 /rules 失败: %v", err), ""}}
+	}
+	if !ok {
+		if !mounted {
+			return []Finding{{FAIL, "provider 挂载行",
+				"provider 已被内核加载但 /rules 无 RULE-SET 行：声明存在、挂载行缺失（规则 prepend 未添加）",
+				"在 Merge 中补 prepend-rules: [RULE-SET,netroamer-autodirect,DIRECT]（参考仓库 clash/rules-merge.yaml），重新激活订阅"}}
+		}
+		return []Finding{{WARN, "provider 生效状态",
+			"配置文件有挂载行但 /rules 未生效——Verge 待重新激活", "在 Clash Verge 重新激活当前订阅"}}
+	}
+	return []Finding{{OK, "provider 挂载",
+		actuator.ProviderName + " 已声明、已挂载、内核已加载（ruleCount 见 netroamerd status）", ""}}
 }
 
 func checkDBPerms(dbPath string) []Finding {
