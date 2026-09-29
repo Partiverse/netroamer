@@ -34,6 +34,9 @@ rule-providers:
   # netroamer:mount-end
 #
 # 注意：RULE-SET 挂载行不能写在这里——Verge 会把未知键（如 prepend-rules）
-# 原样透传给 mihomo，规则不会进入内核 rules 列表（实测）。挂载行由
-# Script 增强项注入（见 clash/verge-script.js，幂等、置于 rules 最前）。
-# 卸载：删除 Script 增强项中的 netroamerd 注入块即可完全回滚。
+# 原样透传给 mihomo，规则进不了内核 rules 列表（实测）。挂载行须粘进
+# 同订阅的「规则 prepend 增强」（见 rules-prepend.yaml 的 netroamer:mount 段）。
+# 卸载：删除两处 netroamer:mount 指纹段即可完全回滚。
+#
+# 本机实际绑定（profiles.yaml → 订阅 option）：
+#   merge=m58N8RcMC3Nh  rules=rqHIC7QNS8b8  script=srxP26I1CkCf

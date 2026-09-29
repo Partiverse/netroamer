@@ -1,12 +1,18 @@
-# netroamer Clash 规则增强 —— 订阅右键「编辑规则」，粘贴为 prepend 块
-# 三层直连保护的第 2 层；顺序即优先级，PROCESS-NAME 最先
+# netroamer Clash 规则 prepend 模板
+# 粘贴位置：Clash Verge → 当前订阅右键「编辑规则」（对应 profiles/rqHIC7QNS8b8.yaml）
+#
+# netroamerd 的 RULE-SET 挂载行放在这里最稳：Merge 增强里写 prepend-rules
+# 会被 Verge 当未知键透传，规则进不了内核 rules 列表（实测）。
+# 配套：provider 声明必须在同订阅的 Merge 增强里（见 rules-merge.yaml 指纹段），
+# path 用相对路径 netroamer/autodirect.yaml（内核 -d 目录内，SAFE_PATHS 约束）。
+#
+# 卸载：删除下方 netroamer:mount 指纹段 + Merge 里的 provider 声明即可完全回滚。
 prepend:
-  # netroamer:mount-begin —— netroamerd 直连 provider 挂载行
-  # （须在所有代理类规则之前；配套声明见 rules-merge.yaml 指纹段。
-  #   注意：也可以只在 Merge 里用 prepend-rules 挂载，二选一）
+  # netroamer:mount-begin —— netroamerd 自有直连 provider 挂载行
+  # （最高优先级：先于用户任何代理类规则）
   - RULE-SET,netroamer-autodirect,DIRECT
   # netroamer:mount-end
-  # AI 开发工具进程级直连（任何域名兜底）
+  # --- ZCode 直连保护 ---
   - PROCESS-NAME-REGEX,(?i)zcode,DIRECT
   # 内网/链路本地/CGNAT/fake-ip 段不可删直连（no-resolve 零 DNS 依赖；
   # NO_PROXY 之外的 mihomo 侧兜底，防内网流量泄漏给代理出口，见 research/04 §3.5）
