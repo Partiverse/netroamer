@@ -51,8 +51,10 @@ CREATE TABLE IF NOT EXISTS judgments (
   target TEXT,                    -- 域名 或 组名×节点索引
   action TEXT,                    -- 'DIRECT on' | 'switch to #k' | 'revert'
   reason TEXT,                    -- 人类可读判定依据（含关键数字）
-  reverted INTEGER DEFAULT 0
+  reverted INTEGER DEFAULT 0,
+  params_hash TEXT DEFAULT ''     -- 判定参数指纹（P2-10：算法迭代可归因）
 );
+CREATE INDEX IF NOT EXISTS idx_judgments_target ON judgments(target, ts);
 `
 
 // Store 打开 telemetry.db：WAL、busy_timeout、单连接（SQLite 单写者防锁表），
@@ -78,6 +80,10 @@ func Open(path string) (*Store, error) {
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
+	}
+	if err := migrateJudgments(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate judgments: %w", err)
 	}
 	privs.ChmodFile(path)
 	privs.ChmodFile(path + "-wal")
@@ -241,6 +247,90 @@ func (s *Store) LastAggRun(ctx context.Context) (int64, error) {
 	var ts int64
 	err := s.db.QueryRowContext(ctx, `SELECT coalesce(max(updated_at),0) FROM agg`).Scan(&ts)
 	return ts, err
+}
+
+// AllAgg 全量聚合行（judge 输入；agg 表行数有限，无需分页）。
+func (s *Store) AllAgg(ctx context.Context) ([]AggRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT bucket, host_sld, via, ewma_ms, p95_ms, fail_rate, n, updated_at FROM agg`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AggRow
+	for rows.Next() {
+		var r AggRow
+		if err := rows.Scan(&r.Bucket, &r.Host, &r.Via, &r.EwmaMs, &r.P95Ms, &r.FailRate, &r.N, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// Judgment 是 judgments 表一行：一次自动判定/动作/回滚的留档。
+type Judgment struct {
+	TS         int64
+	Kind       string
+	Target     string
+	Action     string
+	Reason     string
+	Reverted   bool
+	ParamsHash string
+}
+
+func (s *Store) InsertJudgment(ctx context.Context, j Judgment) error {
+	reverted := 0
+	if j.Reverted {
+		reverted = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO judgments(ts, kind, target, action, reason, reverted, params_hash) VALUES (?,?,?,?,?,?,?)`,
+		j.TS, j.Kind, j.Target, j.Action, j.Reason, reverted, j.ParamsHash)
+	return err
+}
+
+// CountActions 窗口内的动作次数（配额判定；回滚不计入——P0-3 计数语义）。
+func (s *Store) CountActions(ctx context.Context, kind, target string, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM judgments WHERE kind = ? AND target = ? AND ts >= ? AND action != 'revert'`,
+		kind, target, since.Unix()).Scan(&n)
+	return n, err
+}
+
+// LastRevert 目标最近一次回滚时间（0 = 无；冷却判定用）。
+func (s *Store) LastRevert(ctx context.Context, target string) (int64, error) {
+	var ts int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT coalesce(max(ts),0) FROM judgments WHERE target = ? AND action = 'revert'`,
+		target).Scan(&ts)
+	return ts, err
+}
+
+// migrateJudgments 幂等迁移：老库补 judgments.params_hash 列（P2-10）。
+// 表/列名是编译期常量，直接内联在语句里，无任何拼接。
+func migrateJudgments(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(judgments)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "params_hash" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE judgments ADD COLUMN params_hash TEXT DEFAULT ''`)
+	return err
 }
 
 func (s *Store) Close() error { return s.db.Close() }

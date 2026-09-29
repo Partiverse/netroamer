@@ -59,6 +59,9 @@ type Options struct {
 	Secret     string           // Bearer；可为空（API 未设 secret 时）
 	Grace      time.Duration    // 连接从快照消失到判结束的宽限（防单帧解析失败重复落样本）
 	Now        func() time.Time // 可注入时钟；nil = time.Now
+	// Rediscover 断线重连前重新发现端点（P1-9：Clash Verge 重启后 unix socket
+	// 路径含临时目录哈希会变化）。返回空 URL 表示沿用当前端点。
+	Rediscover func() (url, unixSocket, secret string)
 }
 
 // Run 阻塞采集：断线后指数退避（1s→60s + 抖动）重连，
@@ -75,6 +78,14 @@ func Run(ctx context.Context, opt Options, log *slog.Logger, onSamples func(cont
 		}
 		if alive > 30*time.Second {
 			backoff = time.Second
+		}
+		if opt.Rediscover != nil {
+			if u, us, sec := opt.Rediscover(); u != "" {
+				if u != opt.URL || us != opt.UnixSocket {
+					log.Info("mihomo 端点已重发现", "url", u, "unix", us != "")
+				}
+				opt.URL, opt.UnixSocket, opt.Secret = u, us, sec
+			}
 		}
 		wait := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
 		log.Warn("connections 流断开，退避重连",

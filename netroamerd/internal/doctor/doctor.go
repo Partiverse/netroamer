@@ -5,17 +5,15 @@ package doctor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Partiverse/netroamer/netroamerd/internal/config"
+	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
 	"github.com/Partiverse/netroamer/netroamerd/internal/service"
 )
 
@@ -108,34 +106,7 @@ func checkSecret(cfg config.Config) Finding {
 
 // probeAPI 探活 /version（TCP 强制环回或 unix socket，均带 Bearer）。
 func probeAPI(ctx context.Context, cfg config.Config) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	client := service.NewHTTPClient(cfg.UnixSocket, 4*time.Second)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.BaseURL+"/version", nil)
-	if err != nil {
-		return "", err
-	}
-	if cfg.Secret != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.Secret)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("连接 %s 失败: %v", cfg.BaseURL, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized {
-		return "", fmt.Errorf("401：mihomo 已设 secret，但 netroamerd 未发现/不匹配")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	var v struct {
-		Version string `json:"version"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return "", fmt.Errorf("响应解析失败: %v", err)
-	}
-	return v.Version, nil
+	return mihomoapi.New(cfg).Version(ctx)
 }
 
 // checkExposure 扫描 mihomo/Verge 配置的 external-controller 暴露面

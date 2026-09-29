@@ -3,19 +3,25 @@
 netroamer 常驻 agent：基于 mihomo external controller API 的本地无感自愈网络层。
 设计蓝图：[../research/05-netroamerd-design.md](../research/05-netroamerd-design.md)。
 
-## 当前进度：P0 W2（遥测 + 聚合 + 自检 + 常驻安装）
+## 当前进度：P0 W3（判定器：探测器 / 豁免双闸 / 慢域名判定）
 
 - **collector**：WS 订阅 `/connections`（每秒全量快照），连接消失即产出样本；
-  断线指数退避重连（1s→60s + 抖动）；对未知字段宽容解析；只订阅、不注入。
+  断线指数退避重连（1s→60s + 抖动）；断线后自动重发现端点（Verge 重启换 socket 路径）；
+  对未知字段宽容解析；只订阅、不注入。
 - **store**：SQLite（modernc 纯 Go 无 cgo），WAL + busy_timeout + 单连接；
-  目录 0700 / 文件 0600；samples 保留 7 天。
+  目录 0700 / 文件 0600；samples 保留 7 天；judgments 带 target 索引与 params_hash。
 - **analyzer**：每 5 分钟滚动聚合（时段桶 × 主域 × 路径）→ EWMA / P95 / 失败率。
-  W1 样本暂无延迟（主动探测 W3+ 接入后填充），样本量与失败率先行可用。
-- **config**：mihomo 端点与 secret 自动发现（env → `~/.config/netroamer/mihomo.secret`
-  → Clash Verge / mihomo 配置），secret 不回显；TCP 强制环回；
-  实测 Clash Verge Rev 默认只开 unix socket → socket 在盘即优先走 unix。
-- **CLI**：`run`（常驻采集）/ `status`（延迟矩阵摘要）/ `doctor`（六项自检 + 修复指令）/
-  `install` / `uninstall`（用户级 LaunchAgent / systemd --user）。
+- **mihomoapi**：REST 客户端（version / rules / delay / connections），
+  unix socket 与环回 TCP 双传输，Bearer 鉴权，401 显式区分。
+- **exempt**：慢域名自动直连的资格/豁免双闸（评审 P0-4 修订）——
+  资格 = `.cn` TLD / 内置境内列表 / `~/.config/netroamer/netroamer-allow.txt`；
+  豁免 = 订阅 /rules 中 DOMAIN*→非 DIRECT 本地匹配 + `netroamer-exempt.txt`；零外部拉取。
+- **prober**：同口径探测（同一 `generate_204` URL 分别经 DIRECT 与出口节点），
+  消除握手/首包口径失真；代理侧探测失败 = 不可比较、保守不动作。
+- **judge**：两层统计判定（域名级初筛 ≥50 样本 + 桶级方向验证 ≥3 活跃慢桶）
+  + 配额（7 天 2 次）/ 回滚冷却（7 天）状态机 + params_hash 参数指纹；
+  `netroamerd judge` 单轮试运行只读输出（写 provider 与动作在 W4 actuator）。
+- **CLI**：`run` / `status` / `judge` / `doctor` / `install` / `uninstall`。
 
 ## 构建与运行
 
