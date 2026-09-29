@@ -1081,6 +1081,21 @@ for CFG in \
 done
 [ "$CTRL_WARN" = 0 ] && ok "mihomo external-controller 未发现暴露配置（未检测到本地配置文件也视为通过）"
 
+# --- 5.8/6 netroamerd 常驻 agent（可选：需 Go 工具链）---
+if [ -d "$SCRIPT_DIR/netroamerd" ] && command -v go >/dev/null 2>&1; then
+  echo "--- 5.8/6 netroamerd 常驻 agent ---"
+  if (cd "$SCRIPT_DIR/netroamerd" && go build -o netroamerd ./cmd/netroamerd 2>/dev/null) \
+    && "$SCRIPT_DIR/netroamerd/netroamerd" install; then
+    ok "netroamerd 已安装（影子模式：只记录自愈建议，不动作）"
+    echo "  查看: netroamerd status / netroamerd doctor"
+    echo "  实际执行动作（写规则/切节点）: 编辑 LaunchAgent 参数加 --actuate（确认稳定后再开）"
+  else
+    warn "netroamerd 构建或安装失败（不影响其余功能）；可稍后手动: cd netroamerd && go build -o netroamerd ./cmd/netroamerd && ./netroamerd install"
+  fi
+else
+  echo "--- 5.8/6 netroamerd（跳过：无 Go 工具链或目录缺失）---"
+fi
+
 # --- 收尾自检：rc 文件语法必须能过，否则立即报错退出 ---
 FAIL=0
 for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do

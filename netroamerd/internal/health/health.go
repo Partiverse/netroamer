@@ -12,7 +12,9 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Partiverse/netroamer/netroamerd/internal/evidence"
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
+	"github.com/Partiverse/netroamer/netroamerd/internal/notify"
 	"github.com/Partiverse/netroamer/netroamerd/internal/prober"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
@@ -125,20 +127,21 @@ func (h *NodeHealth) Degraded() bool { return h.ConsecSlow >= SlowStrikes }
 
 // Manager 组级状态与切换决策。
 type Manager struct {
-	api        *mihomoapi.Client
-	st         *store.Store
-	log        *slog.Logger
-	actuate    bool
-	nodes      map[string]*NodeHealth // key: 组名\x00组内索引
-	expectNow  map[string]string      // 我们设置的组选中值（区分用户手动切换）
-	manualAt   map[string]time.Time   // 用户手动切换时刻
-	lastSwitch map[string]time.Time   // 组上次自动切换
-	now        func() time.Time
+	api         *mihomoapi.Client
+	st          *store.Store
+	log         *slog.Logger
+	actuate     bool
+	evidenceDir string
+	nodes       map[string]*NodeHealth // key: 组名\x00组内索引
+	expectNow   map[string]string      // 我们设置的组选中值（区分用户手动切换）
+	manualAt    map[string]time.Time   // 用户手动切换时刻
+	lastSwitch  map[string]time.Time   // 组上次自动切换
+	now         func() time.Time
 }
 
-func New(api *mihomoapi.Client, st *store.Store, log *slog.Logger, actuate bool) *Manager {
+func New(api *mihomoapi.Client, st *store.Store, log *slog.Logger, actuate bool, evidenceDir string) *Manager {
 	return &Manager{
-		api: api, st: st, log: log, actuate: actuate,
+		api: api, st: st, log: log, actuate: actuate, evidenceDir: evidenceDir,
 		nodes: map[string]*NodeHealth{}, expectNow: map[string]string{},
 		manualAt: map[string]time.Time{}, lastSwitch: map[string]time.Time{},
 		now: time.Now,
@@ -270,6 +273,15 @@ func (m *Manager) evaluateGroup(ctx context.Context, gname string, g mihomoapi.P
 	m.lastSwitch[gname] = now
 	_ = m.st.InsertJudgment(ctx, store.Judgment{TS: now.Unix(),
 		Kind: "bad_node", Target: gname, Action: "switch to " + best.name, Reason: reason})
+	if m.evidenceDir != "" {
+		_, _ = evidence.Write(m.evidenceDir, evidence.Record{
+			Time: now, Kind: "bad_node", Target: gname,
+			Action: "switch to " + best.name, Reason: reason,
+			Before: map[string]float64{"score_before": cur.Score(), "consec_fail": float64(cur.ConsecFail)},
+			After:  map[string]float64{"score_best": best.score},
+		})
+	}
+	_ = notify.Send("netroamerd", "已切换 "+gname+"："+g.Now+" → "+best.name)
 	m.log.Warn("health: 已切换坏节点", "group", gname, "from", g.Now, "to", best.name)
 }
 

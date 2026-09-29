@@ -50,7 +50,7 @@ func setup(t *testing.T, probe *fakeProbe) (*store.Store, *Manager, *actuator.Ac
 	t.Cleanup(func() { st.Close() })
 	fm := &fakeMihomo{mounted: true, path: filepath.Join(t.TempDir(), "p.yaml")}
 	act := actuator.New(fm, fm.path)
-	m := New(st, act, probe, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	m := New(st, act, probe, slog.New(slog.NewTextHandler(os.Stderr, nil)), "")
 	cur := time.Now()
 	m.now = func() time.Time { return cur }
 	return st, m, act, &cur
@@ -149,7 +149,7 @@ func TestRetestWindowFailuresRollback(t *testing.T) {
 	}
 	// 本轮探测再失败：6 中 4 败 → 回滚（probe 现在 stub 为失败）
 	*nowP = nowP.Add(ProbeInterval + time.Minute)
-	mFail := New(st, m.act, &fakeProbe{fail: true}, m.log)
+	mFail := New(st, m.act, &fakeProbe{fail: true}, m.log, "")
 	mFail.now = m.now
 	if err := mFail.Tick(ctx); err != nil {
 		t.Fatal(err)

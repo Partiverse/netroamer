@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/Partiverse/netroamer/netroamerd/internal/actuator"
+	"github.com/Partiverse/netroamer/netroamerd/internal/evidence"
+	"github.com/Partiverse/netroamer/netroamerd/internal/notify"
 	"github.com/Partiverse/netroamer/netroamerd/internal/prober"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
@@ -27,15 +29,16 @@ const (
 )
 
 type Manager struct {
-	st  *store.Store
-	act *actuator.Actuator
-	api prober.DelayTester
-	now func() time.Time
-	log *slog.Logger
+	st          *store.Store
+	act         *actuator.Actuator
+	api         prober.DelayTester
+	now         func() time.Time
+	log         *slog.Logger
+	evidenceDir string // 非空时回滚写证据
 }
 
-func New(st *store.Store, act *actuator.Actuator, api prober.DelayTester, log *slog.Logger) *Manager {
-	return &Manager{st: st, act: act, api: api, now: time.Now, log: log}
+func New(st *store.Store, act *actuator.Actuator, api prober.DelayTester, log *slog.Logger, evidenceDir string) *Manager {
+	return &Manager{st: st, act: act, api: api, now: time.Now, log: log, evidenceDir: evidenceDir}
 }
 
 // Tick 由 run 主循环每 5 分钟调用：为活跃动作补齐逐时探测并评估回滚。
@@ -137,9 +140,22 @@ func (m *Manager) evaluate(ctx context.Context, action store.Judgment, series []
 		return fmt.Errorf("回滚热载失败: %w", err)
 	}
 	reason := fmt.Sprintf("复测回滚：窗口 %d 次中失败 %d 次（连续 %d）", len(last), fails, consec)
-	return m.st.InsertJudgment(ctx, store.Judgment{
+	if err := m.st.InsertJudgment(ctx, store.Judgment{
 		TS: now.Unix(), Kind: "slow_direct", Target: action.Target,
 		Action: "revert", Reason: reason, Reverted: true,
 		ParamsHash: action.ParamsHash,
-	})
+	}); err != nil {
+		return err
+	}
+	if m.evidenceDir != "" {
+		_, _ = evidence.Write(m.evidenceDir, evidence.Record{
+			Time: now, Kind: "rollback", Target: action.Target,
+			Action: "revert", Reason: reason,
+			After: map[string]float64{
+				"window_size": float64(len(last)), "failures": float64(fails), "consecutive": float64(consec),
+			},
+		})
+	}
+	_ = notify.Send("netroamerd", "已回滚 "+action.Target+"：直连复测失败")
+	return nil
 }

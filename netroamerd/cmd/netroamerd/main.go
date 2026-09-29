@@ -21,16 +21,18 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/collector"
 	"github.com/Partiverse/netroamer/netroamerd/internal/config"
 	"github.com/Partiverse/netroamer/netroamerd/internal/doctor"
+	"github.com/Partiverse/netroamer/netroamerd/internal/evidence"
 	"github.com/Partiverse/netroamer/netroamerd/internal/exempt"
 	"github.com/Partiverse/netroamer/netroamerd/internal/health"
 	"github.com/Partiverse/netroamer/netroamerd/internal/judge"
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
+	"github.com/Partiverse/netroamer/netroamerd/internal/notify"
 	"github.com/Partiverse/netroamer/netroamerd/internal/retest"
 	"github.com/Partiverse/netroamer/netroamerd/internal/service"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
 
-const version = "0.5.0-w5"
+const version = "0.6.0-w6"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -46,7 +48,11 @@ func main() {
 	case "judge":
 		judgeCmd(log)
 	case "rollback":
-		rollbackCmd(os.Args[2:], log)
+		fs := flag.NewFlagSet("rollback", flag.ExitOnError)
+		last := fs.Int("last", 1, "撤销最近 N 条未回滚动作")
+		_ = fs.Parse(os.Args[2:])
+		n := max(min(*last, 50), 1) // 限幅 1..50，防异常输入
+		rollbackCmd(n, log)
 	case "doctor":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -60,11 +66,10 @@ func main() {
 		fmt.Printf("已安装并启动 %s（用户级，开机自启 + 崩溃拉起）\n日志: %s\n验证: netroamerd status / netroamerd doctor\n",
 			service.Label, filepath.Join(stateDir, "netroamerd.log"))
 	case "uninstall":
-		if err := service.Uninstall(); err != nil && !os.IsNotExist(err) {
-			log.Error("卸载失败", "err", err)
-			os.Exit(1)
-		}
-		fmt.Printf("已停止并移除 %s（遥测数据与 ~/.local/bin/netroamerd 保留）\n", service.Label)
+		fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+		full := fs.Bool("full", false, "全量回滚：同时清理 provider 文件与配置中的挂载指纹段")
+		_ = fs.Parse(os.Args[2:])
+		uninstallCmd(*full, log)
 	case "version", "--version", "-v":
 		fmt.Println("netroamerd", version)
 	case "help", "--help", "-h":
@@ -95,7 +100,7 @@ func usage() {
   netroamerd rollback [--last N]  撤销最近 N 条直连动作（默认 1）
   netroamerd doctor          环境自检：secret、API 可达、暴露面、NO_PROXY、权限、挂载、常驻
   netroamerd install         安装并启动用户级常驻（macOS LaunchAgent / Linux systemd --user）
-  netroamerd uninstall       停止并移除常驻（数据与二进制保留）
+  netroamerd uninstall [--full]  停止常驻；--full 全量回滚（provider+挂载指纹段）
   netroamerd version
 
 run flags:
@@ -176,9 +181,10 @@ func run(args []string, log *slog.Logger) {
 
 	// 判定/动作/复测（05 §4.1；W4）+ 节点健康（§4.2；W5）：缺省影子模式
 	api := mihomoapi.New(cfg)
-	hm := health.New(api, st, log, *actuate)
+	evidenceDir := filepath.Join(filepath.Dir(cfg.DBPath), "evidence")
+	hm := health.New(api, st, log, *actuate, evidenceDir)
 	act := actuator.New(api, cfg.ProviderPath)
-	rt := retest.New(st, act, api, log)
+	rt := retest.New(st, act, api, log, evidenceDir)
 	paramsHash := judge.Default().Hash()
 	runJudge := func() {
 		ctxJ, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -226,6 +232,11 @@ func run(args []string, log *slog.Logger) {
 			_ = st.InsertJudgment(ctxJ, store.Judgment{TS: time.Now().Unix(),
 				Kind: "slow_direct", Target: v.Host, Action: "DIRECT on",
 				Reason: v.Evidence, ParamsHash: paramsHash})
+			_, _ = evidence.Write(evidenceDir, evidence.Record{
+				Time: time.Now(), Kind: "slow_direct", Target: v.Host,
+				Action: "DIRECT on", Reason: v.Evidence,
+			})
+			_ = notify.Send("netroamerd", "慢域名已自动直连："+v.Host)
 			log.Info("已执行直连动作", "host", v.Host, "evidence", v.Evidence)
 		}
 	}
@@ -312,11 +323,44 @@ func exitNodeResolver(api *mihomoapi.Client) func(context.Context, string) (stri
 	}
 }
 
+// uninstallCmd 停止并移除常驻；--full 时全量回滚：
+// LaunchAgent/服务 + 自有 provider 文件 + Verge/mihomo 配置中的
+// netroamer:mount 指纹段。遥测库与 judgments 保留（回溯依据），
+// 二进制保留（~/.local/bin/netroamerd，可手动删）。
+// 注意：指纹段清理后需在 Verge 重新激活订阅。
+// uninstallCmd 全量回滚（full 由 main 层解析；所有文件路径来自 config 发现）。
+func uninstallCmd(full bool, log *slog.Logger) {
+	if err := service.Uninstall(); err != nil && !os.IsNotExist(err) {
+		log.Error("停止服务失败", "err", err)
+		os.Exit(1)
+	}
+	fmt.Printf("已停止并移除 %s\n", service.Label)
+
+	home, _ := os.UserHomeDir()
+	if full {
+		cfg, err := config.Load()
+		if err == nil {
+			if err := os.Remove(cfg.ProviderPath); err == nil {
+				fmt.Println("已删除自有 provider:", cfg.ProviderPath)
+			}
+		}
+		cleaned := 0
+		for _, p := range actuator.MountFingerprintFiles(home) {
+			if ok, err := actuator.CleanupMount(p); err == nil && ok {
+				cleaned++
+				fmt.Println("已清理挂载指纹段:", filepath.Base(p))
+			}
+		}
+		if cleaned > 0 {
+			fmt.Println("!! 请在 Clash Verge 重新激活订阅，使清理生效")
+		}
+	}
+	fmt.Println("保留：遥测库 ~/.local/state/netroamer/telemetry.db（judgments 留档）、二进制 ~/.local/bin/netroamerd（可手动删）")
+}
+
 // rollbackCmd 手动撤销最近 N 条直连动作（provider 移除 + 热载验证 + judgments 留档）。
-func rollbackCmd(args []string, log *slog.Logger) {
-	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
-	last := fs.Int("last", 1, "撤销最近 N 条未回滚动作")
-	_ = fs.Parse(args)
+// n 由 main 层解析并限幅（1..50）；文件路径全部来自 config 发现，不接受外部路径。
+func rollbackCmd(n int, log *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	cfg, err := config.Load()
@@ -339,7 +383,7 @@ func rollbackCmd(args []string, log *slog.Logger) {
 	}
 	var targets []string
 	seen := map[string]bool{}
-	for i := len(actions) - 1; i >= 0 && len(targets) < *last; i-- {
+	for i := len(actions) - 1; i >= 0 && len(targets) < n; i-- {
 		if t := actions[i].Target; !seen[t] {
 			seen[t] = true
 			targets = append(targets, t)
@@ -357,6 +401,9 @@ func rollbackCmd(args []string, log *slog.Logger) {
 		_ = st.InsertJudgment(ctx, store.Judgment{TS: time.Now().Unix(),
 			Kind: "slow_direct", Target: t, Action: "revert",
 			Reason: "手动 rollback", Reverted: true, ParamsHash: judge.Default().Hash()})
+		_, _ = evidence.Write(filepath.Join(filepath.Dir(cfg.DBPath), "evidence"),
+			evidence.Record{Time: time.Now(), Kind: "rollback", Target: t,
+				Action: "revert", Reason: "手动 rollback"})
 		fmt.Println("已回滚:", t)
 	}
 }
