@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Partiverse/netroamer/netroamerd/internal/config"
@@ -149,20 +150,28 @@ func (c *Client) PutProvider(ctx context.Context, name string) error {
 	return nil
 }
 
-// ProviderInfo 是 /providers/rules/{name} 的最小解析（回读验证用）。
+// ProviderInfo 是 rule-provider 的最小解析（回读验证用）。
 type ProviderInfo struct {
 	Name      string `json:"name"`
 	Behavior  string `json:"behavior"`
 	RuleCount int    `json:"ruleCount"`
+	UpdatedAt string `json:"updatedAt"`
 }
 
-// ProviderInfo 回读 provider 状态；404 表示未挂载（HTTP 404 走 get 的非 200 分支）。
+// ProviderInfo 回读 provider 状态。
+// 注意：mihomo 只在 /providers/rules/{name} 上接受 PUT（热载），GET 返回
+// 405——必须经 /providers/rules 列表端点筛选（实测）。
 func (c *Client) ProviderInfo(ctx context.Context, name string) (ProviderInfo, error) {
-	var out ProviderInfo
-	if err := c.get(ctx, "/providers/rules/"+url.PathEscape(name), &out); err != nil {
+	var out struct {
+		Providers map[string]ProviderInfo `json:"providers"`
+	}
+	if err := c.get(ctx, "/providers/rules", &out); err != nil {
 		return ProviderInfo{}, err
 	}
-	return out, nil
+	if info, ok := out.Providers[name]; ok {
+		return info, nil
+	}
+	return ProviderInfo{}, fmt.Errorf("provider %s 未加载（内核未挂载或配置校验失败）", name)
 }
 
 // RuleSetMounted 检查 /rules 中是否存在指向 name 的 RULE-SET 行
@@ -173,7 +182,9 @@ func (c *Client) RuleSetMounted(ctx context.Context, name string) (bool, error) 
 		return false, err
 	}
 	for _, r := range rules {
-		if r.Type == "RuleSet" && r.Payload == name {
+		// mihomo 的 /rules 返回 CamelCase 类型名（RuleSet/DomainSuffix/…），
+		// 非全大写（实测）——比较需大小写不敏感
+		if strings.EqualFold(r.Type, "RuleSet") && r.Payload == name {
 			return true, nil
 		}
 	}
