@@ -91,6 +91,12 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// MihomoConfigPaths 返回常见 mihomo/Clash Verge 配置路径（doctor 复用）。
+func MihomoConfigPaths(home string) []string { return mihomoConfigPaths(home) }
+
+// YAMLScalar 导出顶层标量解析（doctor 扫 external-controller/secret 复用）。
+func YAMLScalar(text, key string) string { return yamlScalar(text, key) }
+
 // normalizeBase 补 scheme 并强制环回。
 func normalizeBase(base string) (string, bool, error) {
 	if base == "" {

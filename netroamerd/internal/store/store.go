@@ -132,4 +132,115 @@ func (s *Store) Count(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// Stats 样本总量与时间跨度（status 展示用）。
+func (s *Store) Stats(ctx context.Context) (total, first, last int64, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT count(*), coalesce(min(ts),0), coalesce(max(ts),0) FROM samples`).
+		Scan(&total, &first, &last)
+	return
+}
+
+// RawSample 是 LoadWindow 返回的原始样本（analyzer 聚合输入）。
+type RawSample struct {
+	Ts     int64
+	Host   string
+	Bucket string
+	Via    string
+	LatMs  *int64
+	OK     bool
+}
+
+// LoadWindow 取 since 之后的原始样本（按时间序）。
+func (s *Store) LoadWindow(ctx context.Context, since time.Time) ([]RawSample, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, host_sld, bucket, via, lat_ms, ok FROM samples WHERE ts >= ? ORDER BY ts`,
+		since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RawSample
+	for rows.Next() {
+		var m RawSample
+		var lat sql.NullInt64
+		var ok int
+		if err := rows.Scan(&m.Ts, &m.Host, &m.Bucket, &m.Via, &lat, &ok); err != nil {
+			return nil, err
+		}
+		if lat.Valid {
+			v := lat.Int64
+			m.LatMs = &v
+		}
+		m.OK = ok == 1
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// AggKey 是聚合主键（research/05 §3 agg 表）。
+type AggKey struct{ Bucket, Host, Via string }
+
+// AggRow 是 agg 表一行：某（时段桶 × 主域 × 路径）的滚动统计。
+type AggRow struct {
+	Bucket    string
+	Host      string
+	Via       string
+	EwmaMs    float64
+	P95Ms     float64
+	FailRate  float64
+	N         int
+	UpdatedAt int64
+}
+
+func (s *Store) UpsertAgg(ctx context.Context, rows []AggRow) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO agg
+		(bucket, host_sld, via, ewma_ms, p95_ms, fail_rate, n, updated_at)
+		VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(bucket, host_sld, via) DO UPDATE SET
+		ewma_ms=excluded.ewma_ms, p95_ms=excluded.p95_ms, fail_rate=excluded.fail_rate,
+		n=excluded.n, updated_at=excluded.updated_at`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, r := range rows {
+		if _, err := stmt.ExecContext(ctx, r.Bucket, r.Host, r.Via,
+			r.EwmaMs, r.P95Ms, r.FailRate, r.N, r.UpdatedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// RecentAgg 按样本量降序取聚合行（status 展示）。
+func (s *Store) RecentAgg(ctx context.Context, limit int) ([]AggRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT bucket, host_sld, via, ewma_ms, p95_ms, fail_rate, n, updated_at
+		FROM agg ORDER BY n DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AggRow
+	for rows.Next() {
+		var r AggRow
+		if err := rows.Scan(&r.Bucket, &r.Host, &r.Via, &r.EwmaMs, &r.P95Ms, &r.FailRate, &r.N, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// LastAggRun 最近一次聚合时间（0 = 从未聚合）。
+func (s *Store) LastAggRun(ctx context.Context) (int64, error) {
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(max(updated_at),0) FROM agg`).Scan(&ts)
+	return ts, err
+}
+
 func (s *Store) Close() error { return s.db.Close() }
