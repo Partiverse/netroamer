@@ -33,7 +33,7 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
 
-const version = "0.7.0"
+const version = "1.0.0"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
