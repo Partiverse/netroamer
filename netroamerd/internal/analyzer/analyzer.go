@@ -19,6 +19,9 @@ const (
 
 	// Window 每次聚合回看的样本窗口（rolling 语义：整窗重算）。
 	Window = 6 * time.Hour
+
+	// LatencyWindow 主动采样延迟的有效回看窗口。
+	LatencyWindow = 24 * time.Hour
 )
 
 // Update 重算窗口内聚合并整表刷新 agg，返回写入行数。
@@ -87,4 +90,56 @@ func Update(ctx context.Context, st *store.Store, now time.Time) (int, error) {
 		return 0, err
 	}
 	return len(out), nil
+}
+
+// FillLatencyFromProbes 用主动采样（probes purpose='sampling'，近 LatencyWindow）
+// 回填 agg 的 ewma_ms / p95_ms。被动样本无握手时长（/connections 不提供），
+// 不回填则判定器条件 1 永不满足（实测 agg ewma 全为 0）。返回回填的组数。
+func FillLatencyFromProbes(ctx context.Context, st *store.Store, now time.Time) (int, error) {
+	probes, err := st.ProbesSince(ctx, "sampling", now.Add(-LatencyWindow))
+	if err != nil {
+		return 0, err
+	}
+	if len(probes) == 0 {
+		return 0, nil
+	}
+	// (host, side) → 延迟序列
+	type key struct{ host, side string }
+	series := map[key][]int64{}
+	for _, r := range probes {
+		if !r.OK || r.LatMs == nil {
+			continue
+		}
+		k := key{r.Target, r.Side}
+		series[k] = append(series[k], *r.LatMs)
+	}
+	rows, err := st.AllAgg(ctx)
+	if err != nil {
+		return 0, err
+	}
+	filled := 0
+	for i := range rows {
+		seq, ok := series[key{rows[i].Host, rows[i].Via}]
+		if !ok || len(seq) == 0 {
+			continue
+		}
+		ewma := float64(seq[0])
+		for _, x := range seq[1:] {
+			ewma = EWMAAlpha*float64(x) + (1-EWMAAlpha)*ewma
+		}
+		sorted := append([]int64(nil), seq...)
+		sort.Slice(sorted, func(a, b int) bool { return sorted[a] < sorted[b] })
+		idx := int(math.Ceil(0.95*float64(len(sorted)))) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		rows[i].EwmaMs = ewma
+		rows[i].P95Ms = float64(sorted[idx])
+		rows[i].UpdatedAt = now.Unix()
+		filled++
+	}
+	if filled == 0 {
+		return 0, nil
+	}
+	return filled, st.UpsertAgg(ctx, rows)
 }

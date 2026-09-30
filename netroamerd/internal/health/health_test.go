@@ -82,15 +82,16 @@ func mockMihomo(t *testing.T, actuate bool, consecFails *atomic.Int64, selected 
 				"all": []string{"Bad", "Good", "DIRECT"}},
 		}})
 	})
+	// 分层订阅下 /proxies/{node}/delay 不可用，探测走 /group/{组}/delay（穿透嵌套组）
 	mux.HandleFunc("/proxies/Bad/delay", func(w http.ResponseWriter, r *http.Request) {
-		if consecFails.Load() >= 2 { // 事件驱动阈值：连续 2 败后当前节点持续失败
-			http.Error(w, `{"message":"timeout"}`, http.StatusGatewayTimeout)
-			return
-		}
-		w.Write([]byte(`{"delay":300}`))
+		http.NotFound(w, r)
 	})
 	mux.HandleFunc("/group/Proxy/delay", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]int{"Good": 100}) // Bad 探测失败不出现
+		if consecFails.Load() >= 2 { // 当前节点失败：结果里不含 Bad
+			json.NewEncoder(w).Encode(map[string]int{"Good": 100})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]int{"Bad": 300, "Good": 100})
 	})
 	mux.HandleFunc("/proxies/Proxy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {

@@ -86,3 +86,59 @@ func TestUpdateEmptyWindow(t *testing.T) {
 		t.Fatalf("空库 Update = %d, %v; want 0, nil", n, err)
 	}
 }
+
+// 回归（实测缺口）：被动样本无握手时长 → agg ewma 恒 0 → 判定器永不触发。
+// 主动采样落 probes 后，FillLatencyFromProbes 必须把延迟回填进 agg。
+func TestFillLatencyFromProbes(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Now()
+
+	// 被动样本：agg 只有 n、没有延迟
+	if err := st.UpsertAgg(ctx, []store.AggRow{
+		{Bucket: "n0-1", Host: "slow.cn", Via: "proxy", N: 60, UpdatedAt: now.Unix()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if filled, err := FillLatencyFromProbes(ctx, st, now); err != nil || filled != 0 {
+		t.Fatalf("无 probes 时应回填 0: %d %v", filled, err)
+	}
+
+	// 主动采样：direct 与 proxy 侧各 4 次
+	var recs []store.ProbeRecord
+	for i, ms := range []int64{800, 900, 1000, 1100} {
+		d := ms
+		recs = append(recs, store.ProbeRecord{TS: now.Unix() - int64(i*60), Target: "slow.cn",
+			Side: "proxy", Purpose: "sampling", LatMs: &d, OK: true})
+	}
+	for i, ms := range []int64{100, 120, 150, 180} {
+		d := ms
+		recs = append(recs, store.ProbeRecord{TS: now.Unix() - int64(i*60), Target: "slow.cn",
+			Side: "direct", Purpose: "sampling", LatMs: &d, OK: true})
+	}
+	if err := st.InsertProbes(ctx, recs); err != nil {
+		t.Fatal(err)
+	}
+
+	filled, err := FillLatencyFromProbes(ctx, st, now)
+	if err != nil || filled != 1 {
+		t.Fatalf("filled = %d err = %v, want 1", filled, err)
+	}
+	rows, _ := st.AllAgg(ctx)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d", len(rows))
+	}
+	if rows[0].EwmaMs < 800 || rows[0].EwmaMs > 1100 {
+		t.Errorf("proxy ewma = %v, want 800..1100", rows[0].EwmaMs)
+	}
+	if rows[0].P95Ms != 1100 {
+		t.Errorf("proxy p95 = %v, want 1100", rows[0].P95Ms)
+	}
+	if rows[0].N != 60 {
+		t.Errorf("回填不应改动样本量 n = %d", rows[0].N)
+	}
+}

@@ -173,7 +173,8 @@ func (m *Manager) Tick(ctx context.Context) {
 			h = newNodeHealth()
 			m.nodes[key] = h
 		}
-		ms, err := m.api.DelayTest(ctx, g.Now, prober.TestURL("www.gstatic.com"), 5*time.Second)
+		// 分层订阅：g.Now 可能是嵌套组（/proxies/{组} 504），用组级探测穿透
+		ms, err := m.api.CurrentPathDelay(ctx, gname, g.Now, prober.TestURL("www.gstatic.com"), 5*time.Second)
 		if err != nil {
 			h.Observe(false, 0, now)
 		} else {

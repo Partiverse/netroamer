@@ -401,6 +401,34 @@ func (s *Store) InsertProbes(ctx context.Context, recs []ProbeRecord) error {
 	return tx.Commit()
 }
 
+// ProbesSince 取某 purpose 下 since 之后的全部探测（延迟回填用）。
+func (s *Store) ProbesSince(ctx context.Context, purpose string, since time.Time) ([]ProbeRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, target, side, purpose, lat_ms, ok, coalesce(fail_kind,'') FROM probes
+		 WHERE purpose = ? AND ts >= ? ORDER BY ts`,
+		purpose, since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProbeRecord
+	for rows.Next() {
+		var r ProbeRecord
+		var lat sql.NullInt64
+		var ok int
+		if err := rows.Scan(&r.TS, &r.Target, &r.Side, &r.Purpose, &lat, &ok, &r.FailKind); err != nil {
+			return nil, err
+		}
+		if lat.Valid {
+			v := lat.Int64
+			r.LatMs = &v
+		}
+		r.OK = ok == 1
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ProbeSeries 取目标的探测序列（回滚滑动窗口判定输入）。
 func (s *Store) ProbeSeries(ctx context.Context, target, purpose string, since time.Time) ([]ProbeRecord, error) {
 	rows, err := s.db.QueryContext(ctx,

@@ -28,11 +28,12 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
 	"github.com/Partiverse/netroamer/netroamerd/internal/notify"
 	"github.com/Partiverse/netroamer/netroamerd/internal/retest"
+	"github.com/Partiverse/netroamer/netroamerd/internal/sampler"
 	"github.com/Partiverse/netroamer/netroamerd/internal/service"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
 
-const version = "0.6.0-w6"
+const version = "0.7.0"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -185,6 +186,8 @@ func run(args []string, log *slog.Logger) {
 	hm := health.New(api, st, log, *actuate, evidenceDir)
 	act := actuator.New(api, cfg.ProviderPath)
 	rt := retest.New(st, act, api, log, evidenceDir)
+	// 主动延迟采样：补齐 /connections 无握手时长的缺口（否则判定器永不触发）
+	sp := sampler.New(api, st, log, exitNodeResolver(api))
 	paramsHash := judge.Default().Hash()
 	runJudge := func() {
 		ctxJ, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -242,12 +245,17 @@ func run(args []string, log *slog.Logger) {
 	}
 
 	updateAgg := func() {
-		n, err := analyzer.Update(ctx, st, time.Now())
+		now := time.Now()
+		n, err := analyzer.Update(ctx, st, now)
 		if err != nil {
 			log.Warn("聚合失败", "err", err)
-		} else {
-			log.Info("聚合完成", "groups", n)
+			return
 		}
+		filled, err := analyzer.FillLatencyFromProbes(ctx, st, now)
+		if err != nil {
+			log.Warn("延迟回填失败", "err", err)
+		}
+		log.Info("聚合完成", "groups", n, "延迟回填", filled)
 	}
 	updateAgg() // 启动先聚合一次（空库无妨）
 
@@ -259,10 +267,15 @@ func run(args []string, log *slog.Logger) {
 	defer judgeTick.Stop()
 	healthTick := time.NewTicker(time.Minute) // 节点健康探测（§4.2：出口 60s/次）
 	defer healthTick.Stop()
+	sampleTick := time.NewTicker(sampler.Interval) // 主动延迟采样（30min/轮）
+	defer sampleTick.Stop()
 	beat := time.NewTicker(10 * time.Minute) // 心跳：72h 挂机验收的存活观测点
 	defer beat.Stop()
 
-	runJudge() // 启动先跑一轮（影子/动作取决于 --actuate）
+	// 启动顺序：先采样（补延迟）→ 再聚合（回填）→ 再判定，保证首轮即有完整输入
+	sp.Tick(ctx)
+	updateAgg()
+	runJudge()
 
 	for {
 		select {
@@ -283,6 +296,8 @@ func run(args []string, log *slog.Logger) {
 			}
 		case <-healthTick.C:
 			hm.Tick(ctx)
+		case <-sampleTick.C:
+			sp.Tick(ctx)
 		case <-prune.C:
 			if n, err := st.Prune(ctx, time.Now(), 7*24*time.Hour); err != nil {
 				log.Warn("样本清理失败", "err", err)
@@ -305,8 +320,9 @@ func run(args []string, log *slog.Logger) {
 	}
 }
 
-// exitNodeResolver 从当前活跃连接解析域名的出口节点（仅内存使用不落库，
-// research/05 §2 红线：不存节点名称）。
+// exitNodeResolver 解析域名当前出口路径（仅内存使用不落库，research/05 §2
+// 红线：不存节点名称）。返回 顶层组名|当前叶子节点名 —— 分层订阅下只有
+// /group/{顶层组}/delay 能穿透嵌套组（实测：叶子节点 404、组 504）。
 func exitNodeResolver(api *mihomoapi.Client) func(context.Context, string) (string, error) {
 	return func(ctx context.Context, host string) (string, error) {
 		conns, err := api.Connections(ctx)
@@ -316,7 +332,7 @@ func exitNodeResolver(api *mihomoapi.Client) func(context.Context, string) (stri
 		for _, c := range conns {
 			if strings.HasSuffix(strings.ToLower(c.Metadata.Host), host) &&
 				len(c.Chains) > 0 && c.Chains[0] != "DIRECT" {
-				return c.Chains[0], nil
+				return c.Chains[len(c.Chains)-1] + "|" + c.Chains[0], nil
 			}
 		}
 		return "", fmt.Errorf("无 %s 的活跃代理连接", host)

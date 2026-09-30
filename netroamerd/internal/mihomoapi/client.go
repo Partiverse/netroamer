@@ -231,6 +231,23 @@ func (c *Client) GroupDelay(ctx context.Context, group, testURL string, timeout 
 	return out, nil
 }
 
+// CurrentPathDelay 探测某顶层策略组当前路径的延迟。
+// 分层订阅（Selector 嵌套 Selector）下 /proxies/{node}/delay 对叶子节点 404、
+// /proxies/{group}/delay 对组 504；只有 /group/{group}/delay 能穿透嵌套组，
+// 返回 叶子节点名→毫秒 映射（实测）。currentNode 取 chains[0]。
+func (c *Client) CurrentPathDelay(ctx context.Context, group, currentNode, testURL string, timeout time.Duration) (int, error) {
+	all, err := c.GroupDelay(ctx, group, testURL, timeout)
+	if err != nil {
+		return 0, err
+	}
+	if ms, ok := all[currentNode]; ok {
+		return ms, nil
+	}
+	// 严格模式：当前节点不在结果里 = 它探测失败。绝不用组内其他节点的延迟
+	// 顶替——那会把「节点已死」误判为「节点健康」（健康判定的方向性错误）。
+	return 0, fmt.Errorf("组 %s 当前节点 %s 探测失败（组内可用: %d 个）", group, currentNode, len(all))
+}
+
 // SelectProxy 切换策略组选中节点（PUT /proxies/{group}）。W5 坏节点切换唯一挂点。
 func (c *Client) SelectProxy(ctx context.Context, group, node string) error {
 	body, err := json.Marshal(map[string]string{"name": node})
