@@ -8,9 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -31,9 +34,10 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/sampler"
 	"github.com/Partiverse/netroamer/netroamerd/internal/service"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
+	"github.com/Partiverse/netroamer/netroamerd/internal/webui"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -71,6 +75,20 @@ func main() {
 		full := fs.Bool("full", false, "全量回滚：同时清理 provider 文件与配置中的挂载指纹段")
 		_ = fs.Parse(os.Args[2:])
 		uninstallCmd(*full, log)
+	case "ui":
+		// 自动打开仅用字面量 URL（不引入任何外部输入到 exec）；
+		// 自定义地址只校验并打印。
+		const defaultURL = "http://127.0.0.1:7790"
+		if len(os.Args) > 2 {
+			clean, ok := loopbackHostPort(os.Args[2])
+			if !ok {
+				fmt.Fprintln(os.Stderr, "拒绝非环回或非法端口的地址:", os.Args[2])
+				os.Exit(2)
+			}
+			fmt.Println("控制台地址: http://"+clean, "（需常驻运行中且未禁用 --ui）")
+			return
+		}
+		fmt.Println("控制台:", defaultURL, "（需常驻运行中且未禁用 --ui；在浏览器打开即可）")
 	case "version", "--version", "-v":
 		fmt.Println("netroamerd", version)
 	case "help", "--help", "-h":
@@ -80,6 +98,27 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// loopbackHostPort 控制台地址安全解析：主机必须环回（127.x/::1/localhost），
+// 端口必须 1..65535 纯数字。返回清洗后的 host:port；不合法一律拒绝——
+// 结果只由白名单字符构成，可安全用于监听与拼 URL/外部命令参数。
+func loopbackHostPort(addr string) (string, bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", false
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", false
+	}
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", false
+		}
+	}
+	return net.JoinHostPort(host, port), true
 }
 
 func mustExe() string {
@@ -102,6 +141,7 @@ func usage() {
   netroamerd doctor          环境自检：secret、API 可达、暴露面、NO_PROXY、权限、挂载、常驻
   netroamerd install         安装并启动用户级常驻（macOS LaunchAgent / Linux systemd --user）
   netroamerd uninstall [--full]  停止常驻；--full 全量回滚（provider+挂载指纹段）
+  netroamerd ui [addr]       打开本地控制台（默认 http://127.0.0.1:7790）
   netroamerd version
 
 run flags:
@@ -121,6 +161,8 @@ func run(args []string, log *slog.Logger) {
 	urlFlag := fs.String("url", "", "覆盖 mihomo API base URL")
 	dbFlag := fs.String("db", "", "覆盖 SQLite 路径")
 	actuate := fs.Bool("actuate", false, "实际执行判定动作（缺省影子模式）")
+	uiFlag := fs.Bool("ui", true, "启动本地控制台（127.0.0.1 只读）")
+	uiAddr := fs.String("ui-addr", "127.0.0.1:7790", "控制台监听地址（必须环回）")
 	_ = fs.Parse(args)
 
 	cfg, err := config.Load()
@@ -188,6 +230,30 @@ func run(args []string, log *slog.Logger) {
 	rt := retest.New(st, act, api, log, evidenceDir)
 	// 主动延迟采样：补齐 /connections 无握手时长的缺口（否则判定器永不触发）
 	sp := sampler.New(api, st, log, exitNodeResolver(api))
+
+	verdictRing := webui.NewRing(500) // 判定结论环形缓冲（控制台时间线）
+
+	// 本地控制台（research/06 §5 Phase A：只读，仅环回）
+	if *uiFlag {
+		if clean, ok := loopbackHostPort(*uiAddr); !ok {
+			log.Warn("控制台地址必须为 127.0.0.1/localhost 环回且端口合法，已禁用", "addr", *uiAddr)
+		} else {
+			*uiAddr = clean
+			handler := webui.Handler(webui.Deps{
+				Version: version, Actuate: *actuate, Started: time.Now(),
+				ST: st, Health: hm, Ring: verdictRing, EvidenceDir: evidenceDir,
+			})
+			srv := &http.Server{Addr: *uiAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+			go func() {
+				log.Info("控制台已启动", "addr", "http://"+*uiAddr)
+				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					log.Warn("控制台退出", "err", err)
+				}
+			}()
+			defer srv.Close()
+		}
+	}
+
 	paramsHash := judge.Default().Hash()
 	runJudge := func() {
 		ctxJ, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -220,6 +286,7 @@ func run(args []string, log *slog.Logger) {
 			return
 		}
 		for _, v := range verdicts {
+			verdictRing.Add(v)
 			if v.Action == "" {
 				log.Info("judge", "host", v.Host, "skip", v.Skipped)
 				continue

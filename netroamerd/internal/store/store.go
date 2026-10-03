@@ -318,6 +318,28 @@ func (s *Store) LastRevert(ctx context.Context, target string) (int64, error) {
 	return ts, err
 }
 
+// RecentJudgments 最近 n 条判定/动作留档（时间倒序，控制台时间线）。
+func (s *Store) RecentJudgments(ctx context.Context, n int) ([]Judgment, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ts, kind, target, action, reason, reverted, coalesce(params_hash,'')
+		 FROM judgments ORDER BY ts DESC LIMIT ?`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Judgment
+	for rows.Next() {
+		var j Judgment
+		var rev int
+		if err := rows.Scan(&j.TS, &j.Kind, &j.Target, &j.Action, &j.Reason, &rev, &j.ParamsHash); err != nil {
+			return nil, err
+		}
+		j.Reverted = rev == 1
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 // LastBadNodeSwitch 最近一次坏节点自动切换时刻（联动静默窗输入）。
 func (s *Store) LastBadNodeSwitch(ctx context.Context) (int64, error) {
 	var ts int64

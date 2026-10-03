@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/Partiverse/netroamer/netroamerd/internal/evidence"
@@ -132,6 +134,7 @@ type Manager struct {
 	log         *slog.Logger
 	actuate     bool
 	evidenceDir string
+	mu          sync.Mutex             // 保护以下 map 与 NodeHealth 字段（Web 线程 Snapshot 并发读）
 	nodes       map[string]*NodeHealth // key: 组名\x00组内索引
 	expectNow   map[string]string      // 我们设置的组选中值（区分用户手动切换）
 	manualAt    map[string]time.Time   // 用户手动切换时刻
@@ -160,6 +163,7 @@ func (m *Manager) Tick(ctx context.Context) {
 		if g.Type != "Selector" || len(g.All) < 2 {
 			continue // 单节点组/非 Selector 不自动切换
 		}
+		m.mu.Lock()
 		// 手动切换检测：now 变化且非我们设置的值
 		if exp, ok := m.expectNow[gname]; ok && g.Now != exp {
 			m.manualAt[gname] = now
@@ -173,20 +177,60 @@ func (m *Manager) Tick(ctx context.Context) {
 			h = newNodeHealth()
 			m.nodes[key] = h
 		}
+		m.mu.Unlock()
+
 		// 分层订阅：g.Now 可能是嵌套组（/proxies/{组} 504），用组级探测穿透
 		ms, err := m.api.CurrentPathDelay(ctx, gname, g.Now, prober.TestURL("www.gstatic.com"), 5*time.Second)
+
+		m.mu.Lock()
 		if err != nil {
 			h.Observe(false, 0, now)
 		} else {
 			h.Observe(true, ms, now)
 		}
+		consecFail := h.ConsecFail
+		m.mu.Unlock()
 		m.recordProbe(gname, g.Now, err == nil, ms, now)
 
 		// 事件驱动：连续 2 次失败即触发全组评估（不必等硬故障）
-		if h.ConsecFail >= SlowStrikes {
+		if consecFail >= SlowStrikes {
 			m.evaluateGroup(ctx, gname, g, now)
 		}
 	}
+}
+
+// NodeState 是节点健康的只读快照（Web 控制台展示用）。
+type NodeState struct {
+	Group      string  `json:"group"`
+	Node       string  `json:"node"`
+	EwmaMs     float64 `json:"ewma_ms"`
+	Penalty    float64 `json:"penalty"`
+	Score      float64 `json:"score"`
+	ConsecFail int     `json:"consec_fail"`
+	ConsecSlow int     `json:"consec_slow"`
+	Samples    int     `json:"samples"`
+}
+
+// Snapshot 输出全部节点健康快照（按组名+分数排序）。
+func (m *Manager) Snapshot() []NodeState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]NodeState, 0, len(m.nodes))
+	for key, h := range m.nodes {
+		group, node, _ := strings.Cut(key, "\x00")
+		out = append(out, NodeState{
+			Group: group, Node: node,
+			EwmaMs: h.Ewma, Penalty: h.Penalty, Score: h.Score(),
+			ConsecFail: h.ConsecFail, ConsecSlow: h.ConsecSlow, Samples: h.Samples,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		return out[i].Score < out[j].Score
+	})
+	return out
 }
 
 func (m *Manager) recordProbe(group, node string, ok bool, ms int, now time.Time) {
@@ -206,13 +250,14 @@ func (m *Manager) recordProbe(group, node string, ok bool, ms int, now time.Time
 
 // evaluateGroup 全组对比与切换决策。
 func (m *Manager) evaluateGroup(ctx context.Context, gname string, g mihomoapi.ProxyGroup, now time.Time) {
+	m.mu.Lock()
 	curKey := gname + "\x00" + g.Now
 	cur := m.nodes[curKey]
-
-	// 防抖：10 分钟内切换过不再动
 	if last, ok := m.lastSwitch[gname]; ok && now.Sub(last) < SwitchCooldown {
-		return
+		m.mu.Unlock()
+		return // 防抖：10 分钟内切换过不再动
 	}
+	m.mu.Unlock()
 
 	delays, err := m.api.GroupDelay(ctx, gname, prober.TestURL("www.gstatic.com"), 5*time.Second)
 	if err != nil {
@@ -224,6 +269,7 @@ func (m *Manager) evaluateGroup(ctx context.Context, gname string, g mihomoapi.P
 		name  string
 		score float64
 	}
+	m.mu.Lock()
 	var best cand
 	first := true
 	for name, ms := range delays {
@@ -243,11 +289,14 @@ func (m *Manager) evaluateGroup(ctx context.Context, gname string, g mihomoapi.P
 			best, first = cand{name: name, score: s}, false
 		}
 	}
+	m.mu.Unlock()
 	if first || cur == nil {
 		return
 	}
 
+	m.mu.Lock()
 	manual := now.Sub(m.manualAt[gname]) < ManualWindow
+	m.mu.Unlock()
 	hardDown := cur.HardDown()
 	if manual && !hardDown {
 		m.log.Info("health: 手动选择窗口内，不切换", "group", gname, "now", g.Now, "score", cur.Score())
@@ -270,8 +319,10 @@ func (m *Manager) evaluateGroup(ctx context.Context, gname string, g mihomoapi.P
 		m.log.Error("health: 切换失败", "group", gname, "err", err)
 		return
 	}
+	m.mu.Lock()
 	m.expectNow[gname] = best.name
 	m.lastSwitch[gname] = now
+	m.mu.Unlock()
 	_ = m.st.InsertJudgment(ctx, store.Judgment{TS: now.Unix(),
 		Kind: "bad_node", Target: gname, Action: "switch to " + best.name, Reason: reason})
 	if m.evidenceDir != "" {
