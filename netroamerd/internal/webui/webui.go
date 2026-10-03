@@ -215,7 +215,7 @@ func depsStatus(ctx context.Context, d Deps) []Dep {
 	if ver, err := api.Version(ctx); err != nil {
 		deps = append(deps, Dep{"mihomo API", "fail", err.Error() + "（" + transport + "）"})
 	} else {
-		deps = append(deps, Dep{"mihomo API", "ok", "v" + ver + " · " + transport})
+		deps = append(deps, Dep{"mihomo API", "ok", strings.TrimPrefix(ver, "v") + " · " + transport})
 	}
 	// 2) secret
 	if d.Cfg.Secret == "" {
