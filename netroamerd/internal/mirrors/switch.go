@@ -55,6 +55,16 @@ func Switch(home, service, target string) (string, error) {
 		err = gitInsteadOf(home, target == "mirror")
 	case "Docker Hub":
 		err = dockerMirrors(home, target == "mirror")
+	case "Yarn":
+		err = switchYarn(home, target)
+	case "cargo":
+		err = switchCargo(home, target)
+	case "HuggingFace":
+		err = switchHF(home, target)
+	case "Maven":
+		err = switchMaven(home, target)
+	case "Gradle":
+		err = switchGradle(home, target)
 	default:
 		return "", fmt.Errorf("服务 %q 不支持切换（仅展示）", service)
 	}

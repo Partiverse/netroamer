@@ -27,7 +27,7 @@ var mirrorHosts = []string{
 }
 var officialHosts = []string{
 	"formulae.brew.sh", "ghcr.io", "pypi.org", "files.pythonhosted.org",
-	"registry.npmjs.org", "proxy.golang.org", "static.rust-lang.org", "github.com",
+	"registry.npmjs.org", "registry.yarnpkg.com", "proxy.golang.org", "static.rust-lang.org", "github.com",
 }
 
 // Detect 汇总全部服务的镜像状态。extraFiles 为额外扫描的配置文件
@@ -44,11 +44,103 @@ func Detect(home string, extraFiles []string) []Status {
 	out = append(out, row("Go", goProxy(home), home, "~/.config/go/env GOPROXY", "go"))
 	out = append(out, pipRow(home))
 	out = append(out, npmRow(home))
+	out = append(out, yarnRow(home))
 	out = append(out, rustRow(rc, home))
+	out = append(out, cargoRow(home))
+	out = append(out, hfRow(rc, home))
+	out = append(out, mavenRow(home))
+	out = append(out, gradleRow(home))
 	out = append(out, gitRow(home))
 	out = append(out, dockerRow(home))
 	out = append(out, clashSources(extraFiles))
 	return out
+}
+
+// yarnRow yarn 经典配置（.yarnrc）或 berry（.yarnrc.yml）。
+func yarnRow(home string) Status {
+	if v := yarnrcValue(filepath.Join(home, ".yarnrc.yml"), "npmRegistryServer:"); v != "" {
+		return Status{Service: "Yarn (berry)", State: classify(v), Source: v, Via: "~/.yarnrc.yml"}
+	}
+	if v := yarnrcValue(filepath.Join(home, ".yarnrc"), `registry`); v != "" {
+		return Status{Service: "Yarn", State: classify(v), Source: v, Via: "~/.yarnrc registry"}
+	}
+	return row("Yarn", "", home, "~/.yarnrc", "yarn")
+}
+
+// cargoRow ~/.cargo/config.toml 是否有 crates-io 换源（rsproxy 等）。
+func cargoRow(home string) Status {
+	data, err := os.ReadFile(filepath.Join(home, ".cargo", "config.toml"))
+	if err != nil {
+		return row("cargo", "", home, "~/.cargo/config.toml", "cargo")
+	}
+	t := string(data)
+	if strings.Contains(t, "replace-with") && strings.Contains(t, "rsproxy") {
+		return Status{Service: "cargo", State: "mirrored", Source: "crates.io → rsproxy.cn", Via: "~/.cargo/config.toml"}
+	}
+	if strings.Contains(t, "[source.crates-io]") {
+		return Status{Service: "cargo", State: "custom", Source: "存在自定义 source 替换", Via: "~/.cargo/config.toml"}
+	}
+	return Status{Service: "cargo", State: "official", Source: "crates.io（官方）", Via: "~/.cargo/config.toml"}
+}
+
+// hfRow HuggingFace 镜像（HF_ENDPOINT=hf-mirror.com，AI 开发常用）。
+func hfRow(rc map[string]string, home string) Status {
+	v := rc["HF_ENDPOINT"]
+	if v == "" {
+		return row("HuggingFace", "", home, ".zshrc HF_ENDPOINT", "huggingface-cli")
+	}
+	if strings.Contains(v, "hf-mirror.com") {
+		return Status{Service: "HuggingFace", State: "mirrored", Source: v, Via: ".zshrc HF_ENDPOINT"}
+	}
+	return Status{Service: "HuggingFace", State: "official", Source: v, Via: ".zshrc HF_ENDPOINT"}
+}
+
+// mavenRow ~/.m2/settings.xml：不存在=官方；含 aliyun=镜像；其余=自定义。
+func mavenRow(home string) Status {
+	p := filepath.Join(home, ".m2", "settings.xml")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return row("Maven", "", home, "~/.m2/settings.xml", "mvn")
+	}
+	t := string(data)
+	if strings.Contains(t, "maven.aliyun.com") {
+		return Status{Service: "Maven", State: "mirrored", Source: "maven.aliyun.com/repository/public", Via: "~/.m2/settings.xml"}
+	}
+	return Status{Service: "Maven", State: "custom", Source: "settings.xml 为用户自管内容（不自动切换）", Via: "~/.m2/settings.xml"}
+}
+
+// gradleRow ~/.gradle/init.gradle：不存在=官方；含 aliyun=镜像；其余=自定义。
+func gradleRow(home string) Status {
+	p := filepath.Join(home, ".gradle", "init.gradle")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return row("Gradle", "", home, "~/.gradle/init.gradle", "gradle")
+	}
+	t := string(data)
+	if strings.Contains(t, "maven.aliyun.com") {
+		return Status{Service: "Gradle", State: "mirrored", Source: "maven.aliyun.com/repository/public", Via: "~/.gradle/init.gradle"}
+	}
+	return Status{Service: "Gradle", State: "custom", Source: "init.gradle 为用户自管内容（不自动切换）", Via: "~/.gradle/init.gradle"}
+}
+
+// yarnrcValue 取 `key "value"` / `key: value` 形式的值。
+func yarnrcValue(path, key string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, key) {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(t, key))
+		v = strings.Trim(v, "\"'")
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // row 组装单条：source 非空 → 分类；空 → 按 LookPath 区分官方/未安装。
