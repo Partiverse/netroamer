@@ -16,8 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Partiverse/netroamer/netroamerd/internal/actuator"
+	"github.com/Partiverse/netroamer/netroamerd/internal/config"
+	"github.com/Partiverse/netroamer/netroamerd/internal/exempt"
 	"github.com/Partiverse/netroamer/netroamerd/internal/health"
 	"github.com/Partiverse/netroamer/netroamerd/internal/judge"
+	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
 
@@ -71,6 +75,7 @@ type Deps struct {
 	Health      *health.Manager
 	Ring        *Ring
 	EvidenceDir string
+	Cfg         config.Config // 依赖状态检查用（secret 不回显）
 }
 
 func Handler(d Deps) http.Handler {
@@ -100,6 +105,9 @@ func Handler(d Deps) http.Handler {
 	})
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, d.Health.Snapshot())
+	})
+	mux.HandleFunc("/api/deps", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, depsStatus(r.Context(), d))
 	})
 	mux.HandleFunc("/api/evidence", func(w http.ResponseWriter, r *http.Request) {
 		if name := r.URL.Query().Get("name"); name != "" {
@@ -186,6 +194,91 @@ func serveEvidence(w http.ResponseWriter, dir, name string) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(data)
+}
+
+// Dep 是一条依赖的健康状态。
+type Dep struct {
+	Name   string `json:"name"`
+	State  string `json:"state"` // ok | warn | fail
+	Detail string `json:"detail"`
+}
+
+// depsStatus 依赖状态检查（全部只读；与 doctor 口径一致但更轻量）。
+func depsStatus(ctx context.Context, d Deps) []Dep {
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	api := mihomoapi.New(d.Cfg)
+	transport := map[bool]string{true: "unix socket", false: "环回 TCP"}[d.Cfg.UnixSocket != ""]
+
+	deps := []Dep{}
+	// 1) mihomo API
+	if ver, err := api.Version(ctx); err != nil {
+		deps = append(deps, Dep{"mihomo API", "fail", err.Error() + "（" + transport + "）"})
+	} else {
+		deps = append(deps, Dep{"mihomo API", "ok", "v" + ver + " · " + transport})
+	}
+	// 2) secret
+	if d.Cfg.Secret == "" {
+		deps = append(deps, Dep{"mihomo secret", "warn", "未发现——API 已设 secret 时会 401（netroamerd doctor 有修复指令）"})
+	} else {
+		deps = append(deps, Dep{"mihomo secret", "ok", "已发现（值不回显）"})
+	}
+	// 3) provider 挂载与加载
+	info, infoErr := api.ProviderInfo(ctx, actuator.ProviderName)
+	mounted, mountErr := api.RuleSetMounted(ctx, actuator.ProviderName)
+	switch {
+	case infoErr != nil:
+		deps = append(deps, Dep{"直连 provider", "fail", "未加载（" + infoErr.Error() + "）"})
+	case mountErr != nil:
+		deps = append(deps, Dep{"直连 provider", "warn", "已加载 ruleCount=" + strconv.Itoa(info.RuleCount) + "，挂载校验失败"})
+	case !mounted:
+		deps = append(deps, Dep{"直连 provider", "fail", "已加载但 /rules 无 RULE-SET 行——挂载行缺失，动作不会生效"})
+	default:
+		deps = append(deps, Dep{"直连 provider", "ok",
+			"ruleCount=" + strconv.Itoa(info.RuleCount) + " · RULE-SET 已挂载"})
+	}
+	// 4) SQLite
+	if fi, err := os.Stat(d.Cfg.DBPath); err != nil {
+		deps = append(deps, Dep{"遥测库", "fail", d.Cfg.DBPath + "：未创建"})
+	} else {
+		deps = append(deps, Dep{"遥测库", "ok", humanSize(fi.Size()) + " · " + d.Cfg.DBPath})
+	}
+	// 5) allow / exempt 列表
+	home, _ := os.UserHomeDir()
+	allow := exempt.UserList(filepath.Join(home, ".config", "netroamer", "netroamer-allow.txt"))
+	if len(allow) == 0 {
+		deps = append(deps, Dep{"allow 白名单", "warn", "为空——自动直连不会放行任何域名（写入 ~/.config/netroamer/netroamer-allow.txt）"})
+	} else {
+		deps = append(deps, Dep{"allow 白名单", "ok", strconv.Itoa(len(allow)) + " 个域名：" + strings.Join(allow, ", ")})
+	}
+	exm := exempt.UserList(filepath.Join(home, ".config", "netroamer", "netroamer-exempt.txt"))
+	if len(exm) == 0 {
+		deps = append(deps, Dep{"exempt 列表", "ok", "未配置（可选）"})
+	} else {
+		deps = append(deps, Dep{"exempt 列表", "ok", strconv.Itoa(len(exm)) + " 个域名（永不自动直连）"})
+	}
+	// 6) 主动采样成功率（近 24h，直接反映出站探测链路健康）
+	probes, err := d.ST.ProbesSince(ctx, "sampling", time.Now().Add(-24*time.Hour))
+	if err != nil || len(probes) == 0 {
+		deps = append(deps, Dep{"主动采样", "warn", "近 24h 无采样记录（30min/轮，启动即有首轮）"})
+	} else {
+		okN := 0
+		for _, pr := range probes {
+			if pr.OK {
+				okN++
+			}
+		}
+		ratio := 100 * okN / len(probes)
+		state := "ok"
+		if ratio < 50 {
+			state = "fail"
+		} else if ratio < 80 {
+			state = "warn"
+		}
+		deps = append(deps, Dep{"主动采样", state,
+			strconv.Itoa(okN) + "/" + strconv.Itoa(len(probes)) + " 成功（近 24h，直连+代理侧）"})
+	}
+	return deps
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

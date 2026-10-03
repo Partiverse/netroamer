@@ -37,7 +37,7 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/webui"
 )
 
-const version = "1.1.0"
+const version = "0.1.0-alpha"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
