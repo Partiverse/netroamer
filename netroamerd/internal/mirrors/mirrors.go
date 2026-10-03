@@ -24,6 +24,7 @@ var mirrorHosts = []string{
 	"pypi.tuna.tsinghua.edu.cn", "mirrors.aliyun.com", "mirrors.cloud.tencent.com",
 	"mirrors.ustc.edu.cn", "npmmirror.com", "registry.npmmirror.com",
 	"goproxy.cn", "goproxy.io", "rsproxy.cn", "mirrors.",
+	"flutter-io.cn", "hf-mirror.com",
 }
 var officialHosts = []string{
 	"formulae.brew.sh", "ghcr.io", "pypi.org", "files.pythonhosted.org",
@@ -50,6 +51,11 @@ func Detect(home string, extraFiles []string) []Status {
 	out = append(out, hfRow(rc, home))
 	out = append(out, mavenRow(home))
 	out = append(out, gradleRow(home))
+	out = append(out, flutterRow(rc, home))
+	out = append(out, nodeBinRow(rc, home))
+	out = append(out, composerRow(home))
+	out = append(out, gemsRow(home))
+	out = append(out, condaRow(home))
 	out = append(out, gitRow(home))
 	out = append(out, dockerRow(home))
 	out = append(out, clashSources(extraFiles))
@@ -242,6 +248,69 @@ func clashSources(extraFiles []string) Status {
 		}
 	}
 	return Status{Service: "clash 规则源", State: "official", Source: "未检出 gh-proxy 加速（规则源直连）", Via: "配置扫描"}
+}
+
+// flutterRow Flutter 镜像（pub.flutter-io.cn / storage.flutter-io.cn）。
+func flutterRow(rc map[string]string, home string) Status {
+	v := firstNonEmpty(rc["PUB_HOSTED_URL"], rc["FLUTTER_STORAGE_BASE_URL"])
+	return row("Flutter", v, home, ".zshrc PUB_HOSTED_URL", "flutter")
+}
+
+// nodeBinRow Node/Electron 二进制镜像（ELECTRON_MIRROR 等，npm 装原生包高频用）。
+func nodeBinRow(rc map[string]string, home string) Status {
+	v := firstNonEmpty(rc["ELECTRON_MIRROR"], rc["NODEJS_ORG_MIRROR"], rc["NVM_NODEJS_ORG_MIRROR"])
+	return row("Node/Electron 二进制", v, home, ".zshrc ELECTRON_MIRROR", "npm")
+}
+
+// composerRow ~/.composer/config.json：不存在=官方；含 aliyun=镜像；其余=自定义。
+func composerRow(home string) Status {
+	p := filepath.Join(home, ".composer", "config.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return row("Composer", "", home, "~/.composer/config.json", "composer")
+	}
+	t := string(data)
+	if strings.Contains(t, "mirrors.aliyun.com") {
+		return Status{Service: "Composer", State: "mirrored", Source: "mirrors.aliyun.com/composer", Via: "~/.composer/config.json"}
+	}
+	if strings.Contains(t, "packagist.org") {
+		return Status{Service: "Composer", State: "official", Source: "packagist.org（官方）", Via: "~/.composer/config.json"}
+	}
+	return Status{Service: "Composer", State: "custom", Source: "用户自管内容（不自动切换）", Via: "~/.composer/config.json"}
+}
+
+// gemsRow ~/.gemrc：tuna 源=镜像；rubygems.org=官方；其余=自定义。
+func gemsRow(home string) Status {
+	p := filepath.Join(home, ".gemrc")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return row("gems", "", home, "~/.gemrc", "gem")
+	}
+	t := strings.ToLower(string(data))
+	if strings.Contains(t, "tuna.tsinghua") || strings.Contains(t, "rubymirror") {
+		return Status{Service: "gems", State: "mirrored", Source: "RubyGems 镜像（tuna 等）", Via: "~/.gemrc"}
+	}
+	if strings.Contains(t, "rubygems.org") {
+		return Status{Service: "gems", State: "official", Source: "rubygems.org（官方）", Via: "~/.gemrc"}
+	}
+	return Status{Service: "gems", State: "custom", Source: "用户自管内容（不自动切换）", Via: "~/.gemrc"}
+}
+
+// condaRow ~/.condarc：tuna 频道=镜像；defaults/repo.anaconda=官方；其余=自定义。
+func condaRow(home string) Status {
+	p := filepath.Join(home, ".condarc")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return row("conda", "", home, "~/.condarc", "conda")
+	}
+	t := strings.ToLower(string(data))
+	if strings.Contains(t, "tuna.tsinghua") || strings.Contains(t, "mirrors.") {
+		return Status{Service: "conda", State: "mirrored", Source: "Anaconda 镜像频道（tuna 等）", Via: "~/.condarc"}
+	}
+	if strings.Contains(t, "repo.anaconda.com") || strings.Contains(t, "defaults") {
+		return Status{Service: "conda", State: "official", Source: "defaults 频道（官方）", Via: "~/.condarc"}
+	}
+	return Status{Service: "conda", State: "custom", Source: "用户自管内容（不自动切换）", Via: "~/.condarc"}
 }
 
 func goProxy(home string) string {

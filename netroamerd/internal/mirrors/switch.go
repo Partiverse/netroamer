@@ -65,6 +65,16 @@ func Switch(home, service, target string) (string, error) {
 		err = switchMaven(home, target)
 	case "Gradle":
 		err = switchGradle(home, target)
+	case "Flutter":
+		err = switchFlutter(home, target)
+	case "Node/Electron 二进制":
+		err = switchNodeBin(home, target)
+	case "Composer":
+		err = switchComposer(home, target)
+	case "gems":
+		err = switchGems(home, target)
+	case "conda":
+		err = switchConda(home, target)
 	default:
 		return "", fmt.Errorf("服务 %q 不支持切换（仅展示）", service)
 	}
