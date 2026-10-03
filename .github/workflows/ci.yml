@@ -14,7 +14,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Scan for private artifacts
         run: |
-          PATTERNS='2236067|22619|vless://|vmess://|trojan://|ss://[A-Za-z0-9]|hysteria|subscribe\?token|/api/v1/client/subscribe'
+          # hysteria2?:// 仅匹配 URL scheme（裸 hysteria 会误伤研究文档里的协议名提及）
+          PATTERNS='2236067|22619|vless://|vmess://|trojan://|ss://[A-Za-z0-9]|hysteria2?://|subscribe\?token|/api/v1/client/subscribe'
           # 排除 .github：扫描模式字符串本身写在本文件里，会自匹配
           if grep -rniE "$PATTERNS" --exclude-dir=.git --exclude-dir=.github \
              --include='*.sh' --include='*.ps1' --include='*.yaml' --include='*.yml' --include='*.js' --include='*.md' .; then

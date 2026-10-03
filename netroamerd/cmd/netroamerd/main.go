@@ -227,7 +227,7 @@ func run(args []string, log *slog.Logger) {
 	evidenceDir := filepath.Join(filepath.Dir(cfg.DBPath), "evidence")
 	hm := health.New(api, st, log, *actuate, evidenceDir)
 	act := actuator.New(api, cfg.ProviderPath)
-	rt := retest.New(st, act, api, log, evidenceDir)
+	rt := retest.New(st, act, api, log, evidenceDir, anyProxyPathResolver(api), api)
 	// 主动延迟采样：补齐 /connections 无握手时长的缺口（否则判定器永不触发）
 	sp := sampler.New(api, st, log, exitNodeResolver(api))
 
@@ -384,6 +384,23 @@ func run(args []string, log *slog.Logger) {
 			}
 			return
 		}
+	}
+}
+
+// anyProxyPathResolver 返回任一当前活跃代理路径（顶层组|叶子）——
+// 域名直连后自身无代理连接，变优退出检查用它取「代理现状」做对照。
+func anyProxyPathResolver(api *mihomoapi.Client) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, host string) (string, error) {
+		conns, err := api.Connections(ctx)
+		if err != nil {
+			return "", err
+		}
+		for _, c := range conns {
+			if len(c.Chains) > 0 && c.Chains[0] != "DIRECT" {
+				return c.Chains[len(c.Chains)-1] + "|" + c.Chains[0], nil
+			}
+		}
+		return "", fmt.Errorf("无活跃代理连接")
 	}
 }
 
