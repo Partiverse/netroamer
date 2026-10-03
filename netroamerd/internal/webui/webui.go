@@ -232,6 +232,60 @@ func Handler(d Deps) http.Handler {
 			"state": state, "verified": verified, "reach": reach,
 			"effective": row.Source, "via": row.Via})
 	})
+	// 诊断连通性：单服务测当前源
+	mux.HandleFunc("GET /api/mirrors/test", func(w http.ResponseWriter, r *http.Request) {
+		svc := r.URL.Query().Get("service")
+		if svc == "" {
+			http.Error(w, "service 参数必填", 400)
+			return
+		}
+		home, _ := os.UserHomeDir()
+		state := ""
+		for _, m := range mirrors.Detect(home, nil) {
+			if m.Service == svc {
+				state = m.State
+			}
+		}
+		url := mirrors.TestURLFor(svc, state)
+		if url == "" {
+			writeJSON(w, map[string]any{"service": svc, "testable": false, "state": state})
+			return
+		}
+		ok, ms, detail := mirrors.Probe(url, 4*time.Second)
+		writeJSON(w, map[string]any{"service": svc, "testable": true, "state": state,
+			"url": url, "ok": ok, "latency_ms": ms, "detail": detail})
+	})
+	// 全部服务并发诊断
+	mux.HandleFunc("GET /api/mirrors/test-all", func(w http.ResponseWriter, r *http.Request) {
+		home, _ := os.UserHomeDir()
+		rows := mirrors.Detect(home, nil)
+		type result struct {
+			Service string `json:"service"`
+			State   string `json:"state"`
+			URL     string `json:"url"`
+			OK      bool   `json:"ok"`
+			Latency int64  `json:"latency_ms"`
+			Detail  string `json:"detail"`
+		}
+		out := make([]result, len(rows))
+		var wg sync.WaitGroup
+		for i, m := range rows {
+			out[i] = result{Service: m.Service, State: m.State}
+			url := mirrors.TestURLFor(m.Service, m.State)
+			out[i].URL = url
+			if url == "" {
+				continue
+			}
+			wg.Add(1)
+			go func(i int, url string) {
+				defer wg.Done()
+				ok, ms, detail := mirrors.Probe(url, 4*time.Second)
+				out[i].OK, out[i].Latency, out[i].Detail = ok, ms, detail
+			}(i, url)
+		}
+		wg.Wait()
+		writeJSON(w, map[string]any{"results": out})
+	})
 	mux.HandleFunc("/api/evidence", func(w http.ResponseWriter, r *http.Request) {
 		if name := r.URL.Query().Get("name"); name != "" {
 			serveEvidence(w, d.EvidenceDir, name)

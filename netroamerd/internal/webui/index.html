@@ -182,21 +182,47 @@ async function switchMirror(service, target) {
   }
 }
 
+const diagResults = {}; // service → {ok, latency_ms, detail}
+async function diagOne(service) {
+  try {
+    const r = await j("/api/mirrors/test?service=" + encodeURIComponent(service));
+    diagResults[service] = r.testable ? { ok: r.ok, ms: r.latency_ms, detail: r.detail } : null;
+  } catch (e) { diagResults[service] = { ok: false, ms: 0, detail: String(e) }; }
+  await loadMirrors();
+}
+async function diagAll() {
+  $("mirror-status").innerHTML = '<span class="tag action">全部诊断中…</span>';
+  try {
+    const d2 = await j("/api/mirrors/test-all");
+    for (const r of (d2.results || [])) {
+      diagResults[r.service] = r.url ? { ok: r.ok, ms: r.latency_ms, detail: r.detail } : null;
+    }
+  } catch (e) { diagResults.__err = String(e); }
+  await loadMirrors();
+}
+
 async function loadMirrors() {
   const d2 = await j("/api/mirrors");
   const badge = st => st === "mirrored" ? '<span class="tag direct">镜像</span>'
     : st === "official" ? '<span class="tag skip">官方</span>'
     : st === "custom" ? '<span class="tag action">自定义</span>'
     : '<span class="tag skip">未安装</span>';
-  $("mirrors").innerHTML = `<table><tr><th>服务</th><th>状态</th><th>当前源</th><th>检测来源</th><th>切换</th></tr>` +
-    d2.items.map(m => {
-      let btn = `<span style="color:var(--dim)">—</span>`;
-      if (m.state === "mirrored") btn = `<button class="sw" onclick="switchMirror('${esc(m.service)}','official')">切官方</button>`;
-      else if (m.state === "official" || m.state === "custom") btn = `<button class="sw" onclick="switchMirror('${esc(m.service)}','mirror')">切镜像</button>`;
-      return `<tr><td>${esc(m.service)}</td><td>${badge(m.state)}</td>
-        <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.source)}</td>
-        <td style="color:var(--dim)">${esc(m.via)}</td><td>${btn}</td></tr>`;
-    }).join("") + `</table>`;
+  const rows = d2.items.map(m => {
+    let btn = `<span style="color:var(--dim)">—</span>`;
+    if (m.state === "mirrored") btn = `<button class="sw" onclick="switchMirror('${esc(m.service)}','official')">切官方</button>`;
+    else if (m.state === "official" || m.state === "custom") btn = `<button class="sw" onclick="switchMirror('${esc(m.service)}','mirror')">切镜像</button>`;
+    let diag = `<button class="sw" onclick="diagOne('${esc(m.service)}')">诊断</button>`;
+    const dr = diagResults[m.service];
+    if (dr) {
+      diag = dr.ok ? `<span class="tag direct">✓ ${dr.ms}ms</span>` : `<span class="tag" style="background:#3a1a1a;color:var(--red)">✗ ${esc((dr.detail||"").slice(0,20))}</span>`;
+    } else if (dr === null) {
+      diag = `<span style="color:var(--dim)">不可测</span>`;
+    }
+    return `<tr><td>${esc(m.service)}</td><td>${badge(m.state)}</td>
+      <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.source)}</td>
+      <td style="color:var(--dim)">${esc(m.via)}</td><td>${btn}</td><td>${diag}</td></tr>`;
+  });
+  $("mirrors").innerHTML = `<table><tr><th>服务</th><th>状态</th><th>当前源</th><th>检测来源</th><th>切换</th><th>诊断 <button class="sw" onclick="diagAll()">全部</button></th></tr>${rows.join("")}</table>`;
 }
 
 async function loadTimeline() {

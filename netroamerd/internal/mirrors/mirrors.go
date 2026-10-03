@@ -385,6 +385,53 @@ func classify(source string) string {
 	return "custom"
 }
 
+// testURLs 服务 → [镜像测速URL, 官方测速URL]（诊断连通性用）。
+var testURLs = map[string][2]string{
+	"Homebrew":          {"https://gh-proxy.com/https://formulae.brew.sh/api", "https://formulae.brew.sh"},
+	"pip":               {pipMirrorURL, pipOfficialURL},
+	"npm":               {npmMirrorURL, npmOfficialURL},
+	"Go":                {"https://goproxy.cn", "https://proxy.golang.org"},
+	"Rust (rustup)":     {"https://rsproxy.cn", "https://static.rust-lang.org"},
+	"git (GitHub)":      {"https://gh-proxy.com/https://github.com/", "https://github.com"},
+	"Docker Hub":        {dockerMirror, "https://registry-1.docker.io/v2/"},
+	"Yarn":              {yarnMirrorURL, yarnOfficialURL},
+	"cargo":             {"https://rsproxy.cn", "https://crates.io"},
+	"HuggingFace":       {hfMirrorURL, "https://huggingface.co"},
+	"Flutter":           {flutterPubURL, "https://pub.dev"},
+	"Node/Electron 二进制": {"https://npmmirror.com/mirrors/electron/", "https://nodejs.org"},
+	"Composer":          {composerAliyunURL, "https://packagist.org"},
+	"gems":              {gemsMirrorURL, "https://rubygems.org"},
+	"conda":             {"https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/", "https://repo.anaconda.com"},
+	"Maven":             {mavenAliyunURL, "https://repo.maven.apache.org/maven2/"},
+	"Gradle":            {gradleAliyunURL, "https://services.gradle.org"},
+	"clash 规则源":         {"https://gh-proxy.com/https://raw.githubusercontent.com/", "https://raw.githubusercontent.com"},
+}
+
+// TestURLFor 返回服务在给定状态下的测速 URL（not-found 仍可测官方可达性）。
+func TestURLFor(service, state string) string {
+	tu, ok := testURLs[service]
+	if !ok {
+		return ""
+	}
+	if state == "mirrored" {
+		return tu[0]
+	}
+	return tu[1]
+}
+
+// Probe 测一次连通性：任何 HTTP 响应=可达，返回耗时毫秒。
+func Probe(url string, timeout time.Duration) (bool, int64, string) {
+	start := time.Now()
+	c := &http.Client{Timeout: timeout}
+	resp, err := c.Get(url)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return false, latency, err.Error()
+	}
+	resp.Body.Close()
+	return true, latency, fmt.Sprintf("HTTP %d", resp.StatusCode)
+}
+
 // VerifyReachable 对 http(s) 源做一次可达性探测（3s 超时；
 // 收到任何 HTTP 响应即为可达——镜像站 403/404 也说明链路通）。
 func VerifyReachable(source string) (bool, string) {
