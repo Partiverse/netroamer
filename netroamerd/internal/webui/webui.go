@@ -5,8 +5,12 @@ package webui
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -74,15 +78,16 @@ type GroupSource interface {
 
 // Deps 控制台数据源。
 type Deps struct {
-	Version     string
-	Actuate     bool
-	Started     time.Time
-	ST          *store.Store
-	Health      *health.Manager
-	Ring        *Ring
-	EvidenceDir string
-	Cfg         config.Config // 依赖状态检查用（secret 不回显）
-	API         GroupSource   // 组视图（nil = 面板显示不可用）
+	Version      string
+	Actuate      bool
+	Started      time.Time
+	ST           *store.Store
+	Health       *health.Manager
+	Ring         *Ring
+	EvidenceDir  string
+	Cfg          config.Config // 依赖状态检查用（secret 不回显）
+	API          GroupSource   // 组视图（nil = 面板显示不可用）
+	StateDirPath string        // 写操作令牌文件所在（ui-token）
 }
 
 func Handler(d Deps) http.Handler {
@@ -168,6 +173,40 @@ func Handler(d Deps) http.Handler {
 			}
 		}
 		writeJSON(w, map[string]any{"items": mirrors.Detect(home, append(extra, config.MihomoConfigPaths(home)...))})
+	})
+	// 写操作：镜像切换（Phase B 首块）。令牌鉴权 + judgments 审计。
+	mux.HandleFunc("POST /api/mirrors/switch", func(w http.ResponseWriter, r *http.Request) {
+		token, err := ensureToken(d.StateDirPath)
+		if err != nil {
+			http.Error(w, "令牌初始化失败: "+err.Error(), 500)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Auth")), []byte(token)) != 1 {
+			http.Error(w, "unauthorized：写操作需 X-Auth 令牌（内容见 ~/.local/state/netroamer/ui-token 第一行）", 401)
+			return
+		}
+		var req struct {
+			Service string `json:"service"`
+			Target  string `json:"target"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		home, _ := os.UserHomeDir()
+		state, err := mirrors.Switch(home, req.Service, req.Target)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = d.ST.InsertJudgment(ctx, store.Judgment{
+			TS: time.Now().Unix(), Kind: "mirror_switch", Target: req.Service,
+			Action: "→ " + req.Target,
+			Reason: "控制台手动切换，切换后状态 " + state,
+		})
+		writeJSON(w, map[string]any{"service": req.Service, "target": req.Target, "state": state})
 	})
 	mux.HandleFunc("/api/evidence", func(w http.ResponseWriter, r *http.Request) {
 		if name := r.URL.Query().Get("name"); name != "" {
@@ -339,6 +378,34 @@ func depsStatus(ctx context.Context, d Deps) []Dep {
 			strconv.Itoa(okN) + "/" + strconv.Itoa(len(probes)) + " 成功（近 24h，直连+代理侧）"})
 	}
 	return deps
+}
+
+// ensureToken 写操作令牌：首次生成随机 hex 存 state 目录（0600，仅一行令牌），
+// 用户复制进控制台（localStorage）后作为 X-Auth 头。读取时取文件第一行——
+// 文件可能含人工附加的说明行（实测：整文件读回会混入提示行致比较失败）。
+func ensureToken(stateDir string) (string, error) {
+	if stateDir == "" {
+		return "", fmt.Errorf("state 目录未配置")
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", err
+	}
+	p := filepath.Join(stateDir, "ui-token")
+	if b, err := os.ReadFile(p); err == nil {
+		first := strings.TrimSpace(strings.SplitN(string(b), "\n", 2)[0])
+		if len(first) >= 16 {
+			return first, nil
+		}
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	t := hex.EncodeToString(buf)
+	if err := os.WriteFile(p, []byte(t+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return t, nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

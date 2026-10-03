@@ -233,6 +233,8 @@ func run(args []string, log *slog.Logger) {
 
 	verdictRing := webui.NewRing(500) // 判定结论环形缓冲（控制台时间线）
 
+	stateDirPath, _ := service.StateDir()
+
 	// 本地控制台（research/06 §5 Phase A：只读，仅环回）
 	if *uiFlag {
 		if clean, ok := loopbackHostPort(*uiAddr); !ok {
@@ -242,6 +244,7 @@ func run(args []string, log *slog.Logger) {
 			handler := webui.Handler(webui.Deps{
 				Version: version, Actuate: *actuate, Started: time.Now(),
 				ST: st, Health: hm, Ring: verdictRing, EvidenceDir: evidenceDir, Cfg: cfg, API: api,
+				StateDirPath: stateDirPath,
 			})
 			srv := &http.Server{Addr: *uiAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 			go func() {
