@@ -222,18 +222,24 @@ func run(args []string, log *slog.Logger) {
 		collectorErr <- collector.Run(ctx, opts, log, st.InsertSamples)
 	}()
 
+	stateDirPath, _ := service.StateDir()
+	paramsHash := judge.Default().Hash()
+
+	// 运行模式热切 + allow 路径（控制台与判定周期共用）
+	modeNow := func() bool { return config.ReadMode(stateDirPath, *actuate) }
+	homeDir, _ := os.UserHomeDir()
+	allowPath := filepath.Join(homeDir, ".config", "netroamer", "netroamer-allow.txt")
+
 	// 判定/动作/复测（05 §4.1；W4）+ 节点健康（§4.2；W5）：缺省影子模式
 	api := mihomoapi.New(cfg)
 	evidenceDir := filepath.Join(filepath.Dir(cfg.DBPath), "evidence")
-	hm := health.New(api, st, log, *actuate, evidenceDir)
+	hm := health.New(api, st, log, modeNow, evidenceDir)
 	act := actuator.New(api, cfg.ProviderPath)
 	rt := retest.New(st, act, api, log, evidenceDir, anyProxyPathResolver(api), api)
 	// 主动延迟采样：补齐 /connections 无握手时长的缺口（否则判定器永不触发）
 	sp := sampler.New(api, st, log, exitNodeResolver(api))
 
 	verdictRing := webui.NewRing(500) // 判定结论环形缓冲（控制台时间线）
-
-	stateDirPath, _ := service.StateDir()
 
 	// 本地控制台（research/06 §5 Phase A：只读，仅环回）
 	if *uiFlag {
@@ -244,7 +250,8 @@ func run(args []string, log *slog.Logger) {
 			handler := webui.Handler(webui.Deps{
 				Version: version, Actuate: *actuate, Started: time.Now(),
 				ST: st, Health: hm, Ring: verdictRing, EvidenceDir: evidenceDir, Cfg: cfg, API: api,
-				StateDirPath: stateDirPath,
+				StateDirPath: stateDirPath, FlagActuate: *actuate,
+				AllowPath: allowPath, Act: act, ParamsHash: paramsHash,
 			})
 			srv := &http.Server{Addr: *uiAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 			go func() {
@@ -257,7 +264,7 @@ func run(args []string, log *slog.Logger) {
 		}
 	}
 
-	paramsHash := judge.Default().Hash()
+	paramsHash = judge.Default().Hash()
 	runJudge := func() {
 		ctxJ, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
@@ -294,8 +301,8 @@ func run(args []string, log *slog.Logger) {
 				log.Info("judge", "host", v.Host, "skip", v.Skipped)
 				continue
 			}
-			if !*actuate {
-				log.Info("judge 影子建议（--actuate 后执行）", "host", v.Host, "evidence", v.Evidence)
+			if !modeNow() {
+				log.Info("judge 影子建议（控制台可热切实操）", "host", v.Host, "evidence", v.Evidence)
 				continue
 			}
 			if err := act.Enable(ctxJ, v.Host); err != nil {

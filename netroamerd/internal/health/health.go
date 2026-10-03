@@ -132,7 +132,7 @@ type Manager struct {
 	api         *mihomoapi.Client
 	st          *store.Store
 	log         *slog.Logger
-	actuate     bool
+	actuateFn   func() bool // 每次评估实时读取（支持控制台热切模式）
 	evidenceDir string
 	mu          sync.Mutex             // 保护以下 map 与 NodeHealth 字段（Web 线程 Snapshot 并发读）
 	nodes       map[string]*NodeHealth // key: 组名\x00组内索引
@@ -142,9 +142,9 @@ type Manager struct {
 	now         func() time.Time
 }
 
-func New(api *mihomoapi.Client, st *store.Store, log *slog.Logger, actuate bool, evidenceDir string) *Manager {
+func New(api *mihomoapi.Client, st *store.Store, log *slog.Logger, actuateFn func() bool, evidenceDir string) *Manager {
 	return &Manager{
-		api: api, st: st, log: log, actuate: actuate, evidenceDir: evidenceDir,
+		api: api, st: st, log: log, actuateFn: actuateFn, evidenceDir: evidenceDir,
 		nodes: map[string]*NodeHealth{}, expectNow: map[string]string{},
 		manualAt: map[string]time.Time{}, lastSwitch: map[string]time.Time{},
 		now: time.Now,
@@ -311,7 +311,7 @@ func (m *Manager) evaluateGroup(ctx context.Context, gname string, g mihomoapi.P
 	if manual && hardDown {
 		reason = "硬故障越过手动选择窗口：" + reason
 	}
-	if !m.actuate {
+	if !m.actuateFn() {
 		m.log.Info("health 影子建议（--actuate 后执行）", "group", gname, "from", g.Now, "to", best.name, "reason", reason)
 		return
 	}

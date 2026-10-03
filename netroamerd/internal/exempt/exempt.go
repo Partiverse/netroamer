@@ -6,6 +6,7 @@ package exempt
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
@@ -111,6 +112,18 @@ func UserList(path string) []string {
 		}
 	}
 	return out
+}
+
+// SaveList 覆写用户列表文件（allow/exempt 管理用），0600。
+func SaveList(path string, items []string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	body := "# netroamer 管理列表（每行一个域名后缀）\n"
+	for _, it := range items {
+		body += strings.ToLower(strings.TrimSpace(it)) + "\n"
+	}
+	return os.WriteFile(path, []byte(body), 0o600)
 }
 
 func normalize(host string) string {

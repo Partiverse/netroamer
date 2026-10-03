@@ -28,6 +28,7 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/judge"
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
 	"github.com/Partiverse/netroamer/netroamerd/internal/mirrors"
+	"github.com/Partiverse/netroamer/netroamerd/internal/retest"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
 
@@ -88,7 +89,11 @@ type Deps struct {
 	EvidenceDir  string
 	Cfg          config.Config // 依赖状态检查用（secret 不回显）
 	API          GroupSource   // 组视图（nil = 面板显示不可用）
-	StateDirPath string        // 写操作令牌文件所在（ui-token）
+	StateDirPath string        // 写操作令牌 / mode 文件所在
+	FlagActuate  bool          // 启动旗标（mode 文件缺省时 fallback）
+	AllowPath    string        // allow 白名单文件
+	Act          *actuator.Actuator
+	ParamsHash   string
 }
 
 func Handler(d Deps) http.Handler {
@@ -161,6 +166,120 @@ func Handler(d Deps) http.Handler {
 		}
 		writeJSON(w, map[string]any{"available": true, "groups": out, "agg_engaged": aggEngaged})
 	})
+	// 运行模式查询/热切（写文件，run 循环下个判定周期生效）
+	mux.HandleFunc("GET /api/mode", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{
+			"mode":    modeName(config.ReadMode(d.StateDirPath, d.FlagActuate)),
+			"written": config.ModeWritten(d.StateDirPath),
+		})
+	})
+	mux.HandleFunc("POST /api/mode", func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r, d.StateDirPath) {
+			return
+		}
+		var req struct {
+			Actuate bool `json:"actuate"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := config.WriteMode(d.StateDirPath, req.Actuate); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = d.ST.InsertJudgment(ctx, store.Judgment{
+			TS: time.Now().Unix(), Kind: "mode_switch", Target: "daemon",
+			Action: map[bool]string{true: "→ actuate", false: "→ shadow"}[req.Actuate],
+			Reason: "控制台热切换（下个判定周期生效）",
+		})
+		writeJSON(w, map[string]any{"mode": modeName(req.Actuate)})
+	})
+
+	// allow 白名单管理
+	mux.HandleFunc("GET /api/allow", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"items": exempt.UserList(d.AllowPath)})
+	})
+	mux.HandleFunc("POST /api/allow", func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r, d.StateDirPath) {
+			return
+		}
+		var req struct {
+			Op     string `json:"op"`
+			Domain string `json:"domain"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		domain := normalizeDomain(req.Domain)
+		if domain == "" {
+			http.Error(w, "domain 无效", 400)
+			return
+		}
+		items := exempt.UserList(d.AllowPath)
+		switch req.Op {
+		case "add":
+			dup := false
+			for _, it := range items {
+				if it == domain {
+					dup = true
+				}
+			}
+			if !dup {
+				items = append(items, domain)
+			}
+		case "remove":
+			var kept []string
+			for _, it := range items {
+				if it != domain {
+					kept = append(kept, it)
+				}
+			}
+			items = kept
+		default:
+			http.Error(w, "op 须为 add|remove", 400)
+			return
+		}
+		if err := exempt.SaveList(d.AllowPath, items); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = d.ST.InsertJudgment(ctx, store.Judgment{
+			TS: time.Now().Unix(), Kind: "allow_edit", Target: domain,
+			Action: req.Op, Reason: "控制台白名单管理",
+		})
+		writeJSON(w, map[string]any{"items": items})
+	})
+
+	// rollback：撤销最近 n 条直连动作
+	mux.HandleFunc("POST /api/rollback", func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r, d.StateDirPath) {
+			return
+		}
+		var req struct {
+			N int `json:"n"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if req.N < 1 || req.N > 50 {
+			http.Error(w, "n 须在 1..50", 400)
+			return
+		}
+		rolled, err := retest.RollbackLast(r.Context(), d.ST, d.Act, req.N, time.Now(), d.ParamsHash)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"rolled": rolled})
+	})
+
 	// 同源下发写操作令牌：SOP 保证跨源页面读不到响应体；
 	// hostCheck 已挡 DNS rebinding。前端自动取用，用户零输入。
 	mux.HandleFunc("/api/token", func(w http.ResponseWriter, r *http.Request) {
@@ -472,6 +591,48 @@ func depsStatus(ctx context.Context, d Deps) []Dep {
 			strconv.Itoa(okN) + "/" + strconv.Itoa(len(probes)) + " 成功（近 24h，直连+代理侧）"})
 	}
 	return deps
+}
+
+// authOK 写操作令牌校验；失败时写 401/500 响应并返回 false。
+func authOK(w http.ResponseWriter, r *http.Request, stateDir string) bool {
+	token, err := ensureToken(stateDir)
+	if err != nil {
+		http.Error(w, "令牌初始化失败: "+err.Error(), 500)
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Auth")), []byte(token)) != 1 {
+		http.Error(w, "unauthorized：写操作需 X-Auth 令牌（内容见 ~/.local/state/netroamer/ui-token 第一行）", 401)
+		return false
+	}
+	return true
+}
+
+func modeName(actuate bool) string {
+	if actuate {
+		return "actuate（实操）"
+	}
+	return "shadow（影子）"
+}
+
+// normalizeDomain 白名单域名校验：剥 scheme/路径，小写，拒绝空白与非法字符。
+func normalizeDomain(in string) string {
+	d := strings.ToLower(strings.TrimSpace(in))
+	d = strings.TrimPrefix(d, "https://")
+	d = strings.TrimPrefix(d, "http://")
+	d = strings.TrimSuffix(d, "/")
+	if i := strings.IndexAny(d, "/?#@ "); i >= 0 {
+		return ""
+	}
+	if d == "" || !strings.Contains(d, ".") || strings.Contains(d, "..") {
+		return ""
+	}
+	for _, r := range d {
+		ok := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == ':'
+		if !ok {
+			return ""
+		}
+	}
+	return d
 }
 
 // ensureToken 写操作令牌：首次生成随机 hex 存 state 目录（0600，仅一行令牌），

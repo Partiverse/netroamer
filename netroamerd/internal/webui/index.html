@@ -41,7 +41,8 @@
 </style>
 </head>
 <body>
-<h1>netroamerd 控制台 <span id="mode" class="tag skip"></span></h1>
+<h1>netroamerd 控制台 <span id="mode" class="tag skip" style="cursor:pointer" title="点击切换影子↔实操（下个判定周期生效）" onclick="toggleMode()"></span>
+  <button class="sw" onclick="rollbackLast()" style="float:right;margin-top:2px">撤销最近动作</button></h1>
 <div class="sub">本地无感自愈网络层 · 数据全部在本机 · <span id="refresh">每 10s 自动刷新</span></div>
 
 <div class="cards" id="cards"></div>
@@ -63,6 +64,11 @@
     Homebrew/Rust/Flutter/Node 二进制/HuggingFace 为 rc 类，新终端生效。
   </div>
   <div id="mirrors"></div>
+</section>
+
+<section>
+  <h2>自动直连白名单（资格闸放行名单，判定周期内生效）</h2>
+  <div id="allow"></div>
 </section>
 
 <section>
@@ -94,9 +100,14 @@ const cls = ms => ms < 300 ? "green" : ms < 800 ? "yellow" : "red";
 async function j(url) { const r = await fetch(url); return r.json(); }
 
 async function loadOverview() {
-  const o = await j("/api/overview");
-  $("mode").textContent = o.mode;
-  $("mode").className = "tag " + (String(o.mode).startsWith("actuate") ? "action" : "skip");
+  const [o, m] = await Promise.all([j("/api/overview"), j("/api/mode").catch(() => null)]);
+  let modeText = o.mode;
+  if (m && m.mode) {
+    modeText = m.mode;
+    CURRENT_ACTUATE = String(m.mode).startsWith("actuate");
+  }
+  $("mode").textContent = modeText + "（点击切换）";
+  $("mode").className = "tag " + (CURRENT_ACTUATE ? "action" : "skip");
   const cards = [
     ["版本", esc(o.version)],
     ["运行时长", o.uptime_h.toFixed(1) + "h"],
@@ -182,7 +193,52 @@ async function switchMirror(service, target) {
   }
 }
 
-const diagResults = {}; // service → {ok, latency_ms, detail}
+const diagResults = {};
+let CURRENT_ACTUATE = null;
+
+async function toggleMode() {
+  if (CURRENT_ACTUATE === null) return;
+  const toActuate = !CURRENT_ACTUATE;
+  if (!confirm(`确定切换到 ${toActuate ? "实操模式（自愈动作将真实执行）" : "影子模式（只记录不执行）"}？下个判定周期（≤5 分钟）生效。`)) return;
+  try {
+    await jpost("/api/mode", { actuate: toActuate });
+    await loadOverview();
+  } catch (e) { alert("切换失败: " + e.message); }
+}
+
+async function rollbackLast() {
+  if (!confirm("确定撤销最近 1 条直连动作？（provider 移除 + 热载验证 + 审计）")) return;
+  try {
+    const r = await jpost("/api/rollback", { n: 1 });
+    alert("已回滚: " + ((r.rolled || []).join(", ") || "（无）"));
+    await Promise.all([loadTimeline(), loadMirrors()]);
+  } catch (e) { alert("回滚失败: " + e.message); }
+}
+
+async function loadAllow() {
+  const d2 = await j("/api/allow");
+  const rows = (d2.items || []);
+  let html = rows.length
+    ? `<table><tr><th>域名后缀</th><th></th></tr>` +
+      rows.map(x => `<tr><td>${esc(x)}</td><td><button class="sw" onclick="allowOp('remove','${esc(x)}')">移除</button></td></tr>`).join("") + `</table>`
+    : `<div class="empty">为空——自动直连不会放行任何域名</div>`;
+  html += `<div style="margin-top:8px;display:flex;gap:8px">
+    <input id="allow-input" placeholder="example.com（域名后缀）"
+      style="flex:1;background:var(--card);border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:6px 10px">
+    <button class="sw" onclick="allowOp('add', document.getElementById('allow-input').value)">添加</button></div>`;
+  $("allow").innerHTML = html;
+}
+async function allowOp(op, domain) {
+  domain = (domain || "").trim();
+  if (!domain) return;
+  if (op === "remove" && !confirm(`从白名单移除 ${domain}？`)) return;
+  try {
+    await jpost("/api/allow", { op, domain });
+    await loadAllow();
+  } catch (e) { alert("操作失败: " + e.message); }
+}
+
+async function loadTimeline() { // service → {ok, latency_ms, detail}
 async function diagOne(service) {
   try {
     const r = await j("/api/mirrors/test?service=" + encodeURIComponent(service));
@@ -294,7 +350,7 @@ async function viewEv(name) {
 
 async function refresh() {
   try {
-    await Promise.all([loadOverview(), loadDeps(), loadGroups(), loadMirrors(), loadTimeline(), loadNodes(), loadMatrix(), loadEvidence()]);
+    await Promise.all([loadOverview(), loadDeps(), loadGroups(), loadMirrors(), loadAllow(), loadTimeline(), loadNodes(), loadMatrix(), loadEvidence()]);
     $("refresh").textContent = "更新于 " + new Date().toLocaleTimeString() + " · 每 10s 自动刷新";
   } catch (e) { $("refresh").textContent = "刷新失败：" + e; }
 }

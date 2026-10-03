@@ -115,7 +115,7 @@ func mockMihomo(t *testing.T, actuate bool, consecFails *atomic.Int64, selected 
 	}
 	t.Cleanup(func() { st.Close() })
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	m := New(mihomoapi.New(mihomoapi.ConfigForTest(srv.URL)), st, log, actuate, "")
+	m := New(mihomoapi.New(mihomoapi.ConfigForTest(srv.URL)), st, log, func() bool { return actuate }, "")
 	fixed := time.Now()
 	m.now = func() time.Time { return fixed }
 	return m, st

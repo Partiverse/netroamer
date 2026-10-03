@@ -192,6 +192,38 @@ func classify(err error) string {
 	return "other"
 }
 
+// RollbackLast 撤销最近 n 条未回滚动作（CLI 与控制台共用）。
+// 返回已回滚的目标列表。actions 窗口 30 天。
+func RollbackLast(ctx context.Context, st *store.Store, act *actuator.Actuator,
+	n int, now time.Time, paramsHash string) ([]string, error) {
+	actions, err := st.ActiveActions(ctx, now, 30*24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	var targets []string
+	seen := map[string]bool{}
+	for i := len(actions) - 1; i >= 0 && len(targets) < n; i-- {
+		if t := actions[i].Target; !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	var rolled []string
+	for _, t := range targets {
+		if err := act.Disable(ctx, t); err != nil {
+			return rolled, fmt.Errorf("回滚 %s: %w", t, err)
+		}
+		if err := st.InsertJudgment(ctx, store.Judgment{
+			TS: now.Unix(), Kind: "slow_direct", Target: t, Action: "revert",
+			Reason: "手动 rollback", Reverted: true, ParamsHash: paramsHash,
+		}); err != nil {
+			return rolled, err
+		}
+		rolled = append(rolled, t)
+	}
+	return rolled, nil
+}
+
 // rollback 统一回滚出口：provider 撤销 + judgments 留档 + 证据 + 通知。
 func (m *Manager) rollback(ctx context.Context, action store.Judgment, reason string, now time.Time) error {
 	if err := m.act.Disable(ctx, action.Target); err != nil {
