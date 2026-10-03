@@ -55,6 +55,11 @@
 </section>
 
 <section>
+  <h2>镜像替换（哪些服务在走镜像源，来自 bootstrap 实际配置的检测）</h2>
+  <div id="mirrors"></div>
+</section>
+
+<section>
   <h2>自愈时间线（影子建议 + 正式动作，最新在前）</h2>
   <div id="timeline"></div>
 </section>
@@ -130,6 +135,18 @@ async function loadGroups() {
   $("groups").innerHTML = `<table><tr><th>组</th><th>类型</th><th>当前选中</th><th>成员数</th><th>构成</th></tr>${rows.join("")}</table>`;
 }
 
+async function loadMirrors() {
+  const d2 = await j("/api/mirrors");
+  const badge = st => st === "mirrored" ? '<span class="tag direct">镜像</span>'
+    : st === "official" ? '<span class="tag skip">官方</span>'
+    : st === "custom" ? '<span class="tag action">自定义</span>'
+    : '<span class="tag skip">未安装</span>';
+  $("mirrors").innerHTML = `<table><tr><th>服务</th><th>状态</th><th>当前源</th><th>检测来源</th></tr>` +
+    d2.items.map(m => `<tr><td>${esc(m.service)}</td><td>${badge(m.state)}</td>
+      <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.source)}</td>
+      <td style="color:var(--dim)">${esc(m.via)}</td></tr>`).join("") + `</table>`;
+}
+
 async function loadTimeline() {
   const t = await j("/api/timeline");
   const rows = [];
@@ -199,7 +216,7 @@ async function viewEv(name) {
 
 async function refresh() {
   try {
-    await Promise.all([loadOverview(), loadDeps(), loadGroups(), loadTimeline(), loadNodes(), loadMatrix(), loadEvidence()]);
+    await Promise.all([loadOverview(), loadDeps(), loadGroups(), loadMirrors(), loadTimeline(), loadNodes(), loadMatrix(), loadEvidence()]);
     $("refresh").textContent = "更新于 " + new Date().toLocaleTimeString() + " · 每 10s 自动刷新";
   } catch (e) { $("refresh").textContent = "刷新失败：" + e; }
 }

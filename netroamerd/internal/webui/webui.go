@@ -22,6 +22,7 @@ import (
 	"github.com/Partiverse/netroamer/netroamerd/internal/health"
 	"github.com/Partiverse/netroamer/netroamerd/internal/judge"
 	"github.com/Partiverse/netroamer/netroamerd/internal/mihomoapi"
+	"github.com/Partiverse/netroamer/netroamerd/internal/mirrors"
 	"github.com/Partiverse/netroamer/netroamerd/internal/store"
 )
 
@@ -153,6 +154,20 @@ func Handler(d Deps) http.Handler {
 			}
 		}
 		writeJSON(w, map[string]any{"available": true, "groups": out, "agg_engaged": aggEngaged})
+	})
+	mux.HandleFunc("/api/mirrors", func(w http.ResponseWriter, r *http.Request) {
+		home, _ := os.UserHomeDir()
+		extra := []string{}
+		vergeProfiles := filepath.Join(home, "Library", "Application Support",
+			"io.github.clash-verge-rev.clash-verge-rev", "profiles")
+		if entries, err := os.ReadDir(vergeProfiles); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
+					extra = append(extra, filepath.Join(vergeProfiles, e.Name()))
+				}
+			}
+		}
+		writeJSON(w, map[string]any{"items": mirrors.Detect(home, append(extra, config.MihomoConfigPaths(home)...))})
 	})
 	mux.HandleFunc("/api/evidence", func(w http.ResponseWriter, r *http.Request) {
 		if name := r.URL.Query().Get("name"); name != "" {
