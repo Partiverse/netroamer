@@ -241,7 +241,7 @@ func run(args []string, log *slog.Logger) {
 			*uiAddr = clean
 			handler := webui.Handler(webui.Deps{
 				Version: version, Actuate: *actuate, Started: time.Now(),
-				ST: st, Health: hm, Ring: verdictRing, EvidenceDir: evidenceDir, Cfg: cfg,
+				ST: st, Health: hm, Ring: verdictRing, EvidenceDir: evidenceDir, Cfg: cfg, API: api,
 			})
 			srv := &http.Server{Addr: *uiAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 			go func() {

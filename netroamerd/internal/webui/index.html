@@ -50,6 +50,11 @@
 </section>
 
 <section>
+  <h2>策略组视图（聚合置顶 · 「承载流量」= 该组被选中或有规则引用）</h2>
+  <div id="groups"></div>
+</section>
+
+<section>
   <h2>自愈时间线（影子建议 + 正式动作，最新在前）</h2>
   <div id="timeline"></div>
 </section>
@@ -100,6 +105,29 @@ async function loadDeps() {
     : '<span class="tag" style="background:#3a1a1a;color:var(--red)">异常</span>';
   $("deps").innerHTML = `<table><tr><th>依赖</th><th>状态</th><th>详情</th></tr>` +
     deps.map(d2 => `<tr><td>${esc(d2.name)}</td><td>${badge(d2.state)}</td><td>${esc(d2.detail)}</td></tr>`).join("") + `</table>`;
+}
+
+async function loadGroups() {
+  const d2 = await j("/api/groups");
+  if (!d2.available) { $("groups").innerHTML = `<div class="empty">策略组不可用（mihomo API 未连接）</div>`; return; }
+  const rows = d2.groups.map(g => {
+    const isAgg = g.name === "聚合";
+    let extra = "";
+    if (isAgg) {
+      const peer = g.members.filter(m => m.startsWith("[")).length;
+      const native = g.members.filter(m => m !== "DIRECT" && !m.startsWith("[")).length;
+      extra = `本订阅 ${native} · 对端 ${peer}`;
+      if (d2.agg_engaged) extra += ' · <span class="tag direct">正在承载流量</span>';
+      else extra += ' · <span class="tag skip">未承载（在主选择组选中「聚合」即接管）</span>';
+    } else if (g.has_agg) {
+      extra = '含聚合选项';
+    }
+    return `<tr${isAgg ? ' style="background:#1a2233"' : ''}>
+      <td>${esc(g.name)}</td>
+      <td>${esc(g.type)}</td><td>${esc(g.now)}</td><td>${g.members.length}</td>
+      <td>${extra}</td></tr>`;
+  });
+  $("groups").innerHTML = `<table><tr><th>组</th><th>类型</th><th>当前选中</th><th>成员数</th><th>构成</th></tr>${rows.join("")}</table>`;
 }
 
 async function loadTimeline() {
@@ -171,7 +199,7 @@ async function viewEv(name) {
 
 async function refresh() {
   try {
-    await Promise.all([loadOverview(), loadDeps(), loadTimeline(), loadNodes(), loadMatrix(), loadEvidence()]);
+    await Promise.all([loadOverview(), loadDeps(), loadGroups(), loadTimeline(), loadNodes(), loadMatrix(), loadEvidence()]);
     $("refresh").textContent = "更新于 " + new Date().toLocaleTimeString() + " · 每 10s 自动刷新";
   } catch (e) { $("refresh").textContent = "刷新失败：" + e; }
 }

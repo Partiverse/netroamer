@@ -134,6 +134,46 @@ unix socket）与对候选域名的主动探测外，不发起任何请求。
 
 ---
 
+## 双订阅聚合（进阶用法）
+
+两个订阅的节点可以聚合到一个组里互为切换。前提：两家订阅都以 proxy-provider
+形式下发节点（当前主流机场形态）。在 Clash Verge 的 **Script 增强**（每个订阅
+各自的脚本，不是全局 Script.js）里注入：
+
+```js
+function main(config) {
+  // ① 对端订阅的「节点源 provider URL」——订阅缓存里节点藏在嵌套
+  //    proxy-provider 后，mihomo provider 不递归，必须直取节点源
+  config["proxy-providers"]["peer-sub"] = {
+    type: "http", url: "<对端节点源URL>", interval: 86400,
+    path: "./providers/peer-sub.yaml",
+    "health-check": { enable: true, url: "https://www.gstatic.com/generate_204", interval: 600 },
+    // ② 两家节点常同名，前缀消除歧义
+    override: { "additional-prefix": "[对端] " }
+  };
+  // ③ 聚合组 = 全部 provider 并集；④ 注入主选择组使其承载流量
+  //   （没有规则/主组引用的组，切换不影响流量——孤儿组等于没加）
+  var provs = Object.keys(config["proxy-providers"]);
+  config["proxy-groups"] = (config["proxy-groups"] || []).filter(g => g.name !== "聚合");
+  config["proxy-groups"].unshift({ name: "聚合", type: "select", proxies: ["DIRECT"], use: provs });
+  ["手动切换", "自动选择"].forEach(name => {
+    config["proxy-groups"].forEach(g => {
+      if (g.name === name && g.type === "select") {
+        g.proxies = g.proxies || [];
+        if (g.proxies.indexOf("聚合") < 0) g.proxies.unshift("聚合");
+      }
+    });
+  });
+  return config;
+}
+```
+
+三个实测教训：订阅缓存/下发配置可能**没有内联节点**（藏在嵌套 provider 后，
+provider 不递归）；生成含 URL 的 YAML 禁用 `yaml.dump` 默认宽度（折行撕裂
+URL）；孤儿组（无规则引用）切换无效。
+
+---
+
 ## 文档
 
 | 文档 | 内容 |

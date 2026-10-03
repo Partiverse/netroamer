@@ -66,6 +66,11 @@ func (r *Ring) Recent(n int) []Entry {
 	return out
 }
 
+// GroupSource 组视图所需的 mihomo 能力子集（*mihomoapi.Client 满足）。
+type GroupSource interface {
+	Groups(ctx context.Context) (map[string]mihomoapi.ProxyGroup, error)
+}
+
 // Deps 控制台数据源。
 type Deps struct {
 	Version     string
@@ -76,6 +81,7 @@ type Deps struct {
 	Ring        *Ring
 	EvidenceDir string
 	Cfg         config.Config // 依赖状态检查用（secret 不回显）
+	API         GroupSource   // 组视图（nil = 面板显示不可用）
 }
 
 func Handler(d Deps) http.Handler {
@@ -108,6 +114,45 @@ func Handler(d Deps) http.Handler {
 	})
 	mux.HandleFunc("/api/deps", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, depsStatus(r.Context(), d))
+	})
+	mux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if d.API == nil {
+			writeJSON(w, map[string]any{"available": false})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+		defer cancel()
+		groups, err := d.API.Groups(ctx)
+		if err != nil {
+			writeJSON(w, map[string]any{"available": false, "err": err.Error()})
+			return
+		}
+		type GroupView struct {
+			Name    string   `json:"name"`
+			Type    string   `json:"type"`
+			Now     string   `json:"now"`
+			Members []string `json:"members"`
+			HasAgg  bool     `json:"has_agg"` // 是否包含「聚合」组（承载流量判定依据）
+		}
+		out := []GroupView{}
+		for name, g := range groups {
+			out = append(out, GroupView{Name: name, Type: g.Type, Now: g.Now,
+				Members: g.All, HasAgg: strings.Contains(strings.Join(g.All, "\u0000"), "聚合")})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if (out[i].Name == "聚合") != (out[j].Name == "聚合") {
+				return out[i].Name == "聚合" // 聚合置顶
+			}
+			return out[i].Name < out[j].Name
+		})
+		aggEngaged := false
+		for _, g := range groups {
+			if g.Name != "聚合" && g.Now == "聚合" {
+				aggEngaged = true // 某主组当前选中聚合 → 聚合正承载流量
+				break
+			}
+		}
+		writeJSON(w, map[string]any{"available": true, "groups": out, "agg_engaged": aggEngaged})
 	})
 	mux.HandleFunc("/api/evidence", func(w http.ResponseWriter, r *http.Request) {
 		if name := r.URL.Query().Get("name"); name != "" {
