@@ -57,7 +57,11 @@
 </section>
 
 <section>
-  <h2>镜像替换（哪些服务在走镜像源，来自 bootstrap 实际配置的检测）</h2>
+  <h2>镜像替换 <span id="mirror-status"></span></h2>
+  <div style="color:var(--dim);font-size:12px;margin-bottom:8px">
+    pip/npm/Go/git/cargo/Yarn/Composer/gems/conda/Docker 切换即时生效；
+    Homebrew/Rust/Flutter/Node 二进制/HuggingFace 为 rc 类，新终端生效。
+  </div>
   <div id="mirrors"></div>
 </section>
 
@@ -137,26 +141,45 @@ async function loadGroups() {
   $("groups").innerHTML = `<table><tr><th>组</th><th>类型</th><th>当前选中</th><th>成员数</th><th>构成</th></tr>${rows.join("")}</table>`;
 }
 
-let AUTH = localStorage.getItem("nr-token") || "";
+let AUTH = "";
+async function ensureAuth() {
+  if (AUTH) return AUTH;
+  try {
+    const t = await j("/api/token");       // 同源 + Host 校验，跨源页面读不到
+    if (t.token) { AUTH = t.token; }
+  } catch (e) { /* 控制台未就绪 */ }
+  return AUTH;
+}
 async function jpost(url, body) {
+  await ensureAuth();
   const r = await fetch(url, { method: "POST",
     headers: { "Content-Type": "application/json", "X-Auth": AUTH },
     body: JSON.stringify(body || {}) });
-  if (r.status === 401) {
-    const t = prompt("写操作需要令牌。打开终端执行：\ncat ~/.local/state/netroamer/ui-token\n并粘贴其第一行：");
-    if (t === null) return null;
-    AUTH = t.trim(); localStorage.setItem("nr-token", AUTH);
-    return jpost(url, body);
-  }
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) throw new Error((await r.text()) || ("HTTP " + r.status));
   return r.json();
 }
+// rc 类服务（Homebrew/Rust/Flutter/Node 二进制/HuggingFace）改的是 shell 配置，
+// 当前已开的终端不受影响：新终端自动生效，或执行 source ~/.zshrc 立即生效。
+const NEW_SHELL = new Set(["Homebrew", "Rust (rustup)", "Flutter", "Node/Electron 二进制", "HuggingFace"]);
+
 async function switchMirror(service, target) {
   if (!confirm(`确定把「${service}」切到 ${target === "mirror" ? "镜像源" : "官方源"}？`)) return;
+  const statusEl = $("mirror-status");
   try {
     const res = await jpost("/api/mirrors/switch", { service, target });
-    if (res !== null) await loadMirrors();
-  } catch (e) { alert("切换失败: " + e.message); }
+    let note = "";
+    if (res.target === "mirror") {
+      note = res.verified ? `镜像可达 ✓（${res.reach}）` : `⚠ 镜像暂不可达（${res.reach}）`;
+    } else {
+      note = "已恢复官方源";
+    }
+    if (NEW_SHELL.has(service)) note += " · rc 类：新终端生效（或 source ~/.zshrc）";
+    else note += " · 即时生效";
+    statusEl.innerHTML = `<span class="tag direct">${esc(note)}</span>`;
+    await loadMirrors();
+  } catch (e) {
+    statusEl.innerHTML = `<span class="tag" style="background:#3a1a1a;color:var(--red)">切换失败：${esc(e.message)}</span>`;
+  }
 }
 
 async function loadMirrors() {

@@ -5,10 +5,13 @@ package mirrors
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Status 一条镜像检测结果。
@@ -380,6 +383,21 @@ func classify(source string) string {
 		}
 	}
 	return "custom"
+}
+
+// VerifyReachable 对 http(s) 源做一次可达性探测（3s 超时；
+// 收到任何 HTTP 响应即为可达——镜像站 403/404 也说明链路通）。
+func VerifyReachable(source string) (bool, string) {
+	if !strings.HasPrefix(source, "http") {
+		return false, "非 HTTP 源，无法探测"
+	}
+	c := &http.Client{Timeout: 3 * time.Second}
+	resp, err := c.Get(source)
+	if err != nil {
+		return false, err.Error()
+	}
+	resp.Body.Close()
+	return true, fmt.Sprintf("HTTP %d", resp.StatusCode)
 }
 
 func firstNonEmpty(vs ...string) string {

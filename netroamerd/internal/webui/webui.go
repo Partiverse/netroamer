@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -160,6 +161,16 @@ func Handler(d Deps) http.Handler {
 		}
 		writeJSON(w, map[string]any{"available": true, "groups": out, "agg_engaged": aggEngaged})
 	})
+	// 同源下发写操作令牌：SOP 保证跨源页面读不到响应体；
+	// hostCheck 已挡 DNS rebinding。前端自动取用，用户零输入。
+	mux.HandleFunc("/api/token", func(w http.ResponseWriter, r *http.Request) {
+		token, err := ensureToken(d.StateDirPath)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"token": token})
+	})
 	mux.HandleFunc("/api/mirrors", func(w http.ResponseWriter, r *http.Request) {
 		home, _ := os.UserHomeDir()
 		extra := []string{}
@@ -206,7 +217,20 @@ func Handler(d Deps) http.Handler {
 			Action: "→ " + req.Target,
 			Reason: "控制台手动切换，切换后状态 " + state,
 		})
-		writeJSON(w, map[string]any{"service": req.Service, "target": req.Target, "state": state})
+		// 切到镜像后立刻探测新源可达性——切换必须可验证，不做摆设
+		verified, reach := false, ""
+		row := mirrors.Status{}
+		for _, m := range mirrors.Detect(home, nil) {
+			if m.Service == req.Service {
+				row = m
+			}
+		}
+		if req.Target == "mirror" {
+			verified, reach = mirrors.VerifyReachable(row.Source)
+		}
+		writeJSON(w, map[string]any{"service": req.Service, "target": req.Target,
+			"state": state, "verified": verified, "reach": reach,
+			"effective": row.Source, "via": row.Via})
 	})
 	mux.HandleFunc("/api/evidence", func(w http.ResponseWriter, r *http.Request) {
 		if name := r.URL.Query().Get("name"); name != "" {
@@ -215,7 +239,7 @@ func Handler(d Deps) http.Handler {
 		}
 		writeJSON(w, listEvidence(d.EvidenceDir))
 	})
-	return safeHeaders(mux)
+	return hostCheck(safeHeaders(mux))
 }
 
 // safeHeaders 统一安全响应头：禁 MIME 嗅探、禁止跨源引用。
@@ -224,6 +248,22 @@ func safeHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// hostCheck DNS rebinding 防护：Host 必须为环回（攻击页无法伪造 Host 头），
+// 这使得同源下发令牌 /api/token 不会被跨源页面读取。
+func hostCheck(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			host = h
+		}
+		if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+			http.Error(w, "forbidden：Host 非环回（DNS rebinding 防护）", 403)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
