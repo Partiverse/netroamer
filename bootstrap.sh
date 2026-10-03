@@ -813,6 +813,8 @@ gh_mirror_on() {
   fi
   if [ -n "$chosen" ] && [ -n "$prefix" ]; then
     git config --global url."${prefix}".insteadOf "https://github.com/"
+    # push 不走镜像（镜像只读，push 会卡凭据）：pushInsteadOf 覆盖 insteadOf
+    git config --global url."https://github.com/".pushInsteadOf "https://github.com/"
     echo "github clone via $chosen"
   else
     echo "github clone: 所有镜像均不可达，请检查代理连接"
